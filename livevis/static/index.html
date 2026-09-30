@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live metrics</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface: #fcfcfb;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    --series: #2a78d6;
+    --good: #0ca30c;
+    --critical: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface: #1a1a19;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --border: rgba(255, 255, 255, 0.10);
+      --series: #3987e5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--text-primary);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+    padding: 16px; max-width: 1400px; margin: 0 auto;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0; flex: 1 1 auto; }
+  .meta { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+  .status { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); }
+  .status::before {
+    content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--critical);
+  }
+  .status.live::before { background: var(--good); }
+  button {
+    font: inherit; color: var(--text-primary); background: var(--surface);
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; cursor: pointer;
+  }
+  main { max-width: 1400px; margin: 0 auto; padding: 0 16px 24px; }
+  #grid {
+    display: grid; gap: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr));
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 12px 8px; min-width: 0;
+  }
+  .card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  .card h2 {
+    font-size: 13px; font-weight: 500; color: var(--text-secondary); margin: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .card .value { font-size: 20px; font-weight: 600; }
+  .plot { position: relative; margin-top: 4px; }
+  .plot canvas { display: block; width: 100%; height: 180px; touch-action: none; }
+  .tip {
+    position: absolute; top: 4px; pointer-events: none; white-space: nowrap;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 8px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  }
+  .tip strong { display: block; font-variant-numeric: tabular-nums; }
+  .tip span { color: var(--text-secondary); font-size: 12px; }
+  .empty { color: var(--muted); padding: 48px 0; text-align: center; }
+  table {
+    width: 100%; border-collapse: collapse; margin-bottom: 16px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  }
+  th, td { padding: 6px 10px; border-bottom: 1px solid var(--grid); text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--text-secondary); font-weight: 500; }
+  td { font-variant-numeric: tabular-nums; }
+  .table-wrap { overflow-x: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Live metrics</h1>
+  <span class="meta" id="meta"></span>
+  <span class="status" id="status">연결 중…</span>
+  <button id="toggle-table" type="button" aria-pressed="false">표 보기</button>
+</header>
+<main>
+  <div class="table-wrap" id="table-wrap" hidden>
+    <table>
+      <thead><tr><th>지표</th><th>step</th><th>최신값</th><th>최소</th><th>최대</th><th>점 개수</th></tr></thead>
+      <tbody id="table-body"></tbody>
+    </table>
+  </div>
+  <div id="grid"></div>
+  <p class="empty" id="empty">아직 기록된 지표가 없습니다. <code>viz.log(step, loss=...)</code> 를 호출하면 여기에 나타납니다.</p>
+</main>
+<script>
+"use strict";
+
+const PAD = { l: 56, r: 14, t: 10, b: 24 };
+const FONT = '11px system-ui, -apple-system, "Segoe UI", sans-serif';
+const nf = new Intl.NumberFormat(undefined, { maximumSignificantDigits: 4 });
+
+const grid = document.getElementById("grid");
+const series = new Map();  // name -> { steps, values, canvas, valueEl, tip, hoverX }
+const dirty = new Set();
+let maxPoints = 5000;
+let lastStep = null;
+let frame = 0;
+
+function fmt(v) {
+  if (!Number.isFinite(v)) return "–";
+  const a = Math.abs(v);
+  if (a !== 0 && (a >= 1e6 || a < 1e-3)) return v.toExponential(2);
+  return nf.format(v);
+}
+
+function niceTicks(lo, hi, count) {
+  const raw = (hi - lo) / count;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  const step = (norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10) * mag;
+  const out = [];
+  for (let v = Math.floor(lo / step) * step; v <= hi + step * 1e-9; v += step) {
+    out.push(+v.toPrecision(12));
+  }
+  if (out[out.length - 1] < hi) out.push(+(out[out.length - 1] + step).toPrecision(12));
+  return out;
+}
+
+function ensure(name) {
+  let s = series.get(name);
+  if (s) return s;
+  const card = document.createElement("section");
+  card.className = "card";
+  const head = document.createElement("div");
+  head.className = "card-head";
+  const h2 = document.createElement("h2");
+  h2.textContent = name;
+  h2.title = name;
+  const valueEl = document.createElement("span");
+  valueEl.className = "value";
+  head.append(h2, valueEl);
+  const plot = document.createElement("div");
+  plot.className = "plot";
+  const canvas = document.createElement("canvas");
+  canvas.setAttribute("role", "img");
+  canvas.setAttribute("aria-label", `${name} 추이`);
+  const tip = document.createElement("div");
+  tip.className = "tip";
+  tip.hidden = true;
+  plot.append(canvas, tip);
+  card.append(head, plot);
+  grid.append(card);
+  document.getElementById("empty").hidden = true;
+
+  s = { name, steps: [], values: [], canvas, valueEl, tip, hoverX: null };
+  canvas.addEventListener("pointermove", (e) => {
+    s.hoverX = e.clientX - canvas.getBoundingClientRect().left;
+    schedule(s);
+  });
+  canvas.addEventListener("pointerleave", () => { s.hoverX = null; schedule(s); });
+  series.set(name, s);
+  return s;
+}
+
+function push(s, step, value) {
+  s.steps.push(step);
+  s.values.push(value === null ? NaN : value);
+  if (s.steps.length > maxPoints) {
+    const extra = s.steps.length - maxPoints;
+    s.steps.splice(0, extra);
+    s.values.splice(0, extra);
+  }
+  schedule(s);
+}
+
+function schedule(s) {
+  dirty.add(s);
+  if (!frame) frame = requestAnimationFrame(render);
+}
+
+function render() {
+  frame = 0;
+  const css = getComputedStyle(document.documentElement);
+  const colors = {};
+  for (const k of ["surface", "muted", "grid", "axis", "series"]) colors[k] = css.getPropertyValue(`--${k}`).trim();
+  for (const s of dirty) draw(s, colors);
+  dirty.clear();
+  updateMeta();
+  if (!document.getElementById("table-wrap").hidden) updateTable();
+}
+
+function nearestIndex(steps, target) {
+  let lo = 0, hi = steps.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (steps[mid] < target) lo = mid + 1; else hi = mid;
+  }
+  if (lo > 0 && Math.abs(steps[lo - 1] - target) <= Math.abs(steps[lo] - target)) lo -= 1;
+  return lo;
+}
+
+function draw(s, c) {
+  const cv = s.canvas;
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) {
+    cv.width = Math.round(W * dpr);
+    cv.height = Math.round(H * dpr);
+  }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const { steps, values } = s;
+  const n = steps.length;
+  let last = n - 1;
+  while (last >= 0 && !Number.isFinite(values[last])) last--;
+  s.valueEl.textContent = last >= 0 ? fmt(values[last]) : "–";
+  if (last < 0) { s.tip.hidden = true; return; }
+
+  let lo = Infinity, hi = -Infinity;
+  for (const v of values) if (Number.isFinite(v)) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  if (lo === hi) { const d = Math.abs(lo) * 0.1 || 1; lo -= d; hi += d; }
+  const yt = niceTicks(lo, hi, 4);
+  const y0 = yt[0], y1 = yt[yt.length - 1];
+  const x0 = steps[0], x1 = steps[n - 1] > x0 ? steps[n - 1] : x0 + 1;
+  const pw = W - PAD.l - PAD.r, ph = H - PAD.t - PAD.b;
+  const X = (st) => PAD.l + ((st - x0) / (x1 - x0)) * pw;
+  const Y = (v) => PAD.t + (1 - (v - y0) / (y1 - y0)) * ph;
+
+  // 가로 격자 + y 눈금
+  ctx.font = FONT;
+  ctx.lineWidth = 1;
+  ctx.fillStyle = c.muted;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  for (const t of yt) {
+    const y = Math.round(Y(t)) + 0.5;
+    ctx.strokeStyle = t === y0 ? c.axis : c.grid;
+    ctx.beginPath(); ctx.moveTo(PAD.l, y); ctx.lineTo(W - PAD.r, y); ctx.stroke();
+    ctx.fillText(fmt(t), PAD.l - 8, y);
+  }
+  // x 눈금 (step)
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  for (const t of niceTicks(x0, x1, Math.max(2, Math.floor(pw / 90)))) {
+    if (t < x0 || t > x1) continue;
+    ctx.fillText(fmt(t), X(t), H - PAD.b + 6);
+  }
+
+  // 선 (NaN 은 끊어서 그린다)
+  ctx.strokeStyle = c.series;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  let pen = false;
+  for (let i = 0; i < n; i++) {
+    const v = values[i];
+    if (!Number.isFinite(v)) { pen = false; continue; }
+    if (pen) ctx.lineTo(X(steps[i]), Y(v)); else ctx.moveTo(X(steps[i]), Y(v));
+    pen = true;
+  }
+  ctx.stroke();
+
+  let marker = last;
+  if (s.hoverX !== null) {
+    const target = x0 + ((s.hoverX - PAD.l) / pw) * (x1 - x0);
+    marker = nearestIndex(steps, target);
+    const x = Math.round(X(steps[marker])) + 0.5;
+    ctx.strokeStyle = c.axis;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, PAD.t + ph); ctx.stroke();
+  }
+  if (Number.isFinite(values[marker])) {
+    const mx = X(steps[marker]), my = Y(values[marker]);
+    ctx.fillStyle = c.surface;
+    ctx.beginPath(); ctx.arc(mx, my, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = c.series;
+    ctx.beginPath(); ctx.arc(mx, my, 4, 0, Math.PI * 2); ctx.fill();
+  }
+
+  if (s.hoverX === null) { s.tip.hidden = true; return; }
+  s.tip.replaceChildren();
+  const strong = document.createElement("strong");
+  strong.textContent = fmt(values[marker]);
+  const sub = document.createElement("span");
+  sub.textContent = `step ${fmt(steps[marker])}`;
+  s.tip.append(strong, sub);
+  s.tip.hidden = false;
+  const mx = X(steps[marker]);
+  const tw = s.tip.offsetWidth;
+  s.tip.style.left = `${mx + 12 + tw > W ? mx - 12 - tw : mx + 12}px`;
+}
+
+function updateMeta() {
+  const count = series.size;
+  document.getElementById("meta").textContent =
+    count ? `step ${lastStep === null ? "–" : fmt(lastStep)} · 지표 ${count}개` : "";
+}
+
+function updateTable() {
+  const body = document.getElementById("table-body");
+  body.replaceChildren();
+  for (const s of series.values()) {
+    const finite = s.values.filter(Number.isFinite);
+    const tr = document.createElement("tr");
+    const cells = [
+      s.name,
+      s.steps.length ? fmt(s.steps[s.steps.length - 1]) : "–",
+      finite.length ? fmt(finite[finite.length - 1]) : "–",
+      finite.length ? fmt(Math.min(...finite)) : "–",
+      finite.length ? fmt(Math.max(...finite)) : "–",
+      String(s.steps.length),
+    ];
+    for (const text of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.append(td);
+    }
+    body.append(tr);
+  }
+}
+
+function reset(data) {
+  document.getElementById("title").textContent = data.title;
+  document.title = data.title;
+  maxPoints = data.max_points;
+  series.clear();
+  grid.replaceChildren();
+  document.getElementById("empty").hidden = false;
+  lastStep = null;
+  for (const [name, points] of Object.entries(data.series)) {
+    const s = ensure(name);
+    for (const [step, value] of points) {
+      push(s, step, value);
+      if (lastStep === null || step > lastStep) lastStep = step;
+    }
+  }
+  updateMeta();
+}
+
+function setStatus(live) {
+  const el = document.getElementById("status");
+  el.classList.toggle("live", live);
+  el.textContent = live ? "실시간 연결됨" : "연결 끊김 · 재연결 중…";
+}
+
+function connect() {
+  const es = new EventSource("events");
+  es.addEventListener("init", (e) => { reset(JSON.parse(e.data)); setStatus(true); });
+  es.addEventListener("log", (e) => {
+    const { step, metrics } = JSON.parse(e.data);
+    lastStep = step;
+    for (const [name, value] of Object.entries(metrics)) push(ensure(name), step, value);
+  });
+  es.addEventListener("error", () => setStatus(false));
+}
+
+document.getElementById("toggle-table").addEventListener("click", (e) => {
+  const wrap = document.getElementById("table-wrap");
+  wrap.hidden = !wrap.hidden;
+  e.currentTarget.setAttribute("aria-pressed", String(!wrap.hidden));
+  e.currentTarget.textContent = wrap.hidden ? "표 보기" : "표 숨기기";
+  if (!wrap.hidden) updateTable();
+});
+new ResizeObserver(() => series.forEach(schedule)).observe(grid);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => series.forEach(schedule));
+connect();
+</script>
+</body>
+</html>

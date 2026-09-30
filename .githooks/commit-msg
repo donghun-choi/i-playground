@@ -1,0 +1,22 @@
+#!/bin/bash
+# 커밋 규칙 강제: 작성자는 donghun-choi, 메시지에는 "claude" 금지.
+set -euo pipefail
+
+msg_file="$1"
+
+# 자동으로 붙는 attribution 트레일러는 조용히 지운다.
+tmp="$(mktemp)"
+grep -viE '^(co-authored-by:.*claude|claude-session:)|generated with \[?claude' "$msg_file" | git stripspace > "$tmp" || true
+cat "$tmp" > "$msg_file"
+rm -f "$tmp"
+
+author="$(git var GIT_AUTHOR_IDENT | sed -E 's/ <.*//')"
+if [ "$author" != "donghun-choi" ]; then
+  echo "commit-msg: 작성자가 '$author' 입니다. 'donghun-choi'로 커밋하세요 (.claude/hooks/session-start.sh 참고)." >&2
+  exit 1
+fi
+
+if grep -v '^#' "$msg_file" | grep -qi 'claude'; then
+  echo "commit-msg: 커밋 메시지에 'claude'를 쓰지 마세요." >&2
+  exit 1
+fi
