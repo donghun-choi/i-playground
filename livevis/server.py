@@ -1,7 +1,8 @@
 """localhost 실시간 시각화 서버 (표준 라이브러리만 사용).
 
 브라우저는 /events 를 Server-Sent Events 로 구독한다. 접속하자마자 지금까지의
-기록 전체(init)를 받고, 이후에는 log() 호출마다 새 값(log)을 받는다.
+기록 전체(init)를 받고, 이후에는 log() 호출마다 새 값(log)을, image() 호출마다
+이미지 갱신 알림(image)을 받는다. 이미지 바이트는 /image/<이름> 에서 따로 받는다.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote
 
 _INDEX = Path(__file__).with_name("static") / "index.html"
 _QUEUE_LIMIT = 10_000
@@ -30,6 +32,8 @@ class _Hub:
         self.title = title
         self.max_points = max_points
         self._series: dict[str, deque] = {}
+        self._images: dict[str, dict] = {}  # 이름 -> 최신 이미지 하나 (version 이 바뀌면 브라우저가 다시 받는다)
+        self._image_version = 0
         self._subs: set[queue.Queue] = set()
         self._lock = threading.Lock()
 
@@ -42,7 +46,12 @@ class _Hub:
             "title": self.title,
             "max_points": self.max_points,
             "series": {name: list(points) for name, points in self._series.items()},
+            "images": {name: _image_meta(name, img) for name, img in self._images.items()},
         }
+
+    def image(self, name: str) -> dict | None:
+        with self._lock:
+            return self._images.get(name)
 
     def subscribe(self) -> tuple[queue.Queue, dict]:
         # 구독 등록과 스냅샷을 한 락 안에서 해야 그 사이의 값이 빠지거나 겹치지 않는다.
@@ -56,18 +65,27 @@ class _Hub:
             self._subs.discard(q)
 
     def publish(self, step, metrics: dict) -> None:
-        event = {"step": step, "metrics": metrics}
         with self._lock:
             for name, value in metrics.items():
                 points = self._series.setdefault(name, deque(maxlen=self.max_points))
                 points.append((step, value))
-            for q in list(self._subs):
-                try:
-                    q.put_nowait(event)
-                except queue.Full:
-                    # 못 따라오는 클라이언트는 끊는다. 브라우저가 재연결하면 init 으로 다시 맞춰진다.
-                    self._subs.discard(q)
-                    self._kick(q)
+            self._broadcast(("log", {"step": step, "metrics": metrics}))
+
+    def publish_image(self, name: str, data: bytes, mime: str, caption: str, step) -> None:
+        with self._lock:
+            self._image_version += 1
+            img = {"version": self._image_version, "data": data, "mime": mime, "caption": caption, "step": step}
+            self._images[name] = img
+            self._broadcast(("image", _image_meta(name, img)))
+
+    def _broadcast(self, event: tuple[str, dict]) -> None:
+        for q in list(self._subs):
+            try:
+                q.put_nowait(event)
+            except queue.Full:
+                # 못 따라오는 클라이언트는 끊는다. 브라우저가 재연결하면 init 으로 다시 맞춰진다.
+                self._subs.discard(q)
+                self._kick(q)
 
     def close(self) -> None:
         with self._lock:
@@ -93,6 +111,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", json.dumps(self.hub.snapshot()).encode())
         elif path == "/events":
             self._stream()
+        elif path.startswith("/image/"):
+            img = self.hub.image(unquote(path[len("/image/"):]))
+            if img is None:
+                self._send(404, "text/plain; charset=utf-8", b"no such image")
+            else:
+                self._send(200, img["mime"], img["data"])
         else:
             self._send(404, "text/plain; charset=utf-8", b"not found")
 
@@ -121,7 +145,7 @@ class _Handler(BaseHTTPRequestHandler):
                     continue
                 if event is None:
                     break
-                self._event("log", event)
+                self._event(*event)
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
@@ -193,6 +217,13 @@ class LiveVis:
         self._next_step = step + 1
         self._hub.publish(step, {name: _finite_or_none(value) for name, value in metrics.items()})
 
+    def image(self, name: str, data: bytes, *, mime: str = "image/png", caption: str = "", step=None) -> None:
+        """이름별로 최신 이미지 하나를 보여준다. 같은 이름으로 다시 부르면 그 자리에서 바뀐다.
+
+        data 는 인코딩된 이미지 바이트(PNG/JPEG 등)다.
+        """
+        self._hub.publish_image(name, bytes(data), mime, caption, step)
+
     def stop(self) -> None:
         if not self._server:
             return
@@ -216,6 +247,10 @@ class LiveVis:
 
     def __exit__(self, *exc) -> None:
         self.stop()
+
+
+def _image_meta(name: str, img: dict) -> dict:
+    return {"name": name, "version": img["version"], "caption": img["caption"], "step": img["step"]}
 
 
 def _finite_or_none(value) -> float | None:

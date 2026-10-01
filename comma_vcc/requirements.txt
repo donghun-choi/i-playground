@@ -1,0 +1,14 @@
+# 챌린지 pyproject.toml 의 의존성 (torch 는 PyPI 판)
+numpy
+einops
+timm
+safetensors
+segmentation-models-pytorch
+tqdm
+pillow
+av
+brotli
+constriction
+pyppmd
+torch
+torchvision

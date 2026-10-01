@@ -89,6 +89,13 @@
   th { color: var(--text-secondary); font-weight: 500; }
   td { font-variant-numeric: tabular-nums; }
   .table-wrap { overflow-x: auto; }
+  #images {
+    display: grid; gap: 12px; margin-bottom: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 560px), 1fr));
+  }
+  #images:empty { display: none; }
+  .card img { display: block; width: 100%; height: auto; margin-top: 8px; border-radius: 4px; image-rendering: auto; }
+  .caption { color: var(--text-secondary); font-size: 12px; margin-top: 6px; white-space: pre-wrap; }
 </style>
 </head>
 <body>
@@ -105,6 +112,7 @@
       <tbody id="table-body"></tbody>
     </table>
   </div>
+  <div id="images"></div>
   <div id="grid"></div>
   <p class="empty" id="empty">아직 기록된 지표가 없습니다. <code>viz.log(step, loss=...)</code> 를 호출하면 여기에 나타납니다.</p>
 </main>
@@ -309,6 +317,37 @@ function draw(s, c) {
   s.tip.style.left = `${mx + 12 + tw > W ? mx - 12 - tw : mx + 12}px`;
 }
 
+const imagesEl = document.getElementById("images");
+const images = new Map();  // name -> { img, caption, stepEl }
+
+function showImage(meta) {
+  let card = images.get(meta.name);
+  if (!card) {
+    const section = document.createElement("section");
+    section.className = "card";
+    const head = document.createElement("div");
+    head.className = "card-head";
+    const h2 = document.createElement("h2");
+    h2.textContent = meta.name;
+    h2.title = meta.name;
+    const stepEl = document.createElement("span");
+    stepEl.className = "meta";
+    head.append(h2, stepEl);
+    const img = document.createElement("img");
+    img.alt = meta.name;
+    const caption = document.createElement("div");
+    caption.className = "caption";
+    section.append(head, img, caption);
+    imagesEl.append(section);
+    document.getElementById("empty").hidden = true;
+    card = { img, caption, stepEl };
+    images.set(meta.name, card);
+  }
+  card.img.src = `image/${encodeURIComponent(meta.name)}?v=${meta.version}`;
+  card.caption.textContent = meta.caption || "";
+  card.stepEl.textContent = meta.step === null || meta.step === undefined ? "" : `step ${fmt(meta.step)}`;
+}
+
 function updateMeta() {
   const count = series.size;
   document.getElementById("meta").textContent =
@@ -344,6 +383,8 @@ function reset(data) {
   maxPoints = data.max_points;
   series.clear();
   grid.replaceChildren();
+  images.clear();
+  imagesEl.replaceChildren();
   document.getElementById("empty").hidden = false;
   lastStep = null;
   for (const [name, points] of Object.entries(data.series)) {
@@ -353,6 +394,7 @@ function reset(data) {
       if (lastStep === null || step > lastStep) lastStep = step;
     }
   }
+  for (const meta of Object.values(data.images || {})) showImage(meta);
   updateMeta();
 }
 
@@ -370,6 +412,7 @@ function connect() {
     lastStep = step;
     for (const [name, value] of Object.entries(metrics)) push(ensure(name), step, value);
   });
+  es.addEventListener("image", (e) => showImage(JSON.parse(e.data)));
   es.addEventListener("error", () => setStatus(false));
 }
 

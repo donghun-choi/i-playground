@@ -4,3 +4,9 @@ __pycache__/
 venv/
 .pytest_cache/
 .DS_Store
+comma_vcc/challenge/
+comma_vcc/.venv/
+comma_vcc/submissions/*/archive/
+comma_vcc/submissions/*/archive.zip
+comma_vcc/submissions/*/inflated/
+comma_vcc/*.log

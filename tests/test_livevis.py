@@ -1,6 +1,7 @@
 import http.client
 import json
 import unittest
+import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
@@ -59,6 +60,32 @@ class LiveVisTest(unittest.TestCase):
         name, data = read_event(resp)
         self.assertEqual(name, "log")
         self.assertEqual(data, {"step": 7, "metrics": {"loss": 0.25}})
+
+    def test_image_is_served_and_announced(self):
+        viz = self.start()
+        viz.image("frame", b"\x89PNG-1", caption="first", step=3)
+
+        conn = http.client.HTTPConnection("127.0.0.1", urlparse(viz.url).port, timeout=5)
+        self.addCleanup(conn.close)
+        conn.request("GET", "/events")
+        resp = conn.getresponse()
+        name, data = read_event(resp)
+        self.assertEqual(data["images"]["frame"], {"name": "frame", "version": 1, "caption": "first", "step": 3})
+
+        viz.image("frame", b"\x89PNG-2")
+        name, data = read_event(resp)
+        self.assertEqual(name, "image")
+        self.assertEqual(data["version"], 2)
+
+        with urllib.request.urlopen(viz.url + "image/frame", timeout=5) as r:
+            self.assertEqual(r.headers["Content-Type"], "image/png")
+            self.assertEqual(r.read(), b"\x89PNG-2")
+
+    def test_missing_image_is_404(self):
+        viz = self.start()
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(viz.url + "image/nope", timeout=5)
+        self.assertEqual(cm.exception.code, 404)
 
 
 def read_event(resp) -> tuple[str, dict]:
