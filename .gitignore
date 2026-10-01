@@ -10,3 +10,5 @@ comma_vcc/submissions/*/archive/
 comma_vcc/submissions/*/archive.zip
 comma_vcc/submissions/*/inflated/
 comma_vcc/*.log
+comma_vcc/cache/
+comma_vcc/submissions/*/live_report.txt
