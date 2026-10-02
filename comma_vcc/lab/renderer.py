@@ -19,7 +19,7 @@ from PIL import Image
 from common import CACHE, SH, SW, load_gt, nets
 import copy
 
-from model import Renderer, quantize_roundtrip  # noqa: E402  (제출물 패키지와 같은 정의)
+from model import Renderer, make_renderer, quantize_roundtrip, render  # noqa: E402  (제출물 패키지와 같은 정의)
 
 PALETTE = np.array([[64, 64, 64], [230, 230, 230], [42, 120, 214], [12, 163, 12], [208, 59, 59]], np.uint8)
 
@@ -43,7 +43,7 @@ def evaluate(G, net, seg, idx, bs=8, rounded=False):
     errs = []
     for i in range(0, len(idx), bs):
         m = torch.from_numpy(seg[idx[i : i + bs]])
-        img = Gq(m)
+        img = render(Gq, m, torch.from_numpy(np.asarray(idx[i : i + bs])))
         out = net.segnet(img.round() if rounded else img).argmax(1)
         errs.append((out != m).float().mean((1, 2)))
     return torch.cat(errs)
@@ -61,6 +61,9 @@ def main():
     ap.add_argument("--round", action="store_true", help="학습 때 출력 반올림 (정수 프레임용, 서브픽셀 확장을 쓰면 불필요)")
     ap.add_argument("--fp32", action="store_true", help="SegNet 을 bf16 대신 fp32 로 (느리지만 평가와 같은 수치)")
     ap.add_argument("--cosine", action="store_true", help="OneCycle 대신 cosine 감쇠 (이어서 학습할 때)")
+    ap.add_argument("--arch", default="v1", help="v1 | v2 (전해상도 + 프레임별 FiLM)")
+    ap.add_argument("--width", type=int, default=48)
+    ap.add_argument("--fdim", type=int, default=8)
     ap.add_argument("--full-eval", action="store_true", help="끝나고 600장 전체 평가")
     args = ap.parse_args()
 
@@ -70,7 +73,8 @@ def main():
     torch.manual_seed(0)
     net = nets()
     _, seg, _ = load_gt()
-    G = Renderer()
+    G = make_renderer((args.width, args.fdim, len(seg), (1, 1, 2, 4)) if args.arch == "v2" else None)
+    net.segnet.to(memory_format=torch.channels_last)
     if args.resume:
         G.load_state_dict(torch.load(args.resume))
     print(f"renderer params: {sum(p.numel() for p in G.parameters()):,}")
@@ -89,7 +93,7 @@ def main():
         perm = np.random.default_rng(ep).permutation(len(seg))
         for b in range(0, len(perm) - args.bs + 1, args.bs):
             m = torch.from_numpy(seg[perm[b : b + args.bs]]).long()
-            img = G(m)
+            img = render(G, m, torch.from_numpy(perm[b : b + args.bs]))
             if args.round:
                 img = quantize_ste(img)
             with torch.autocast("cpu", dtype=torch.bfloat16, enabled=not args.fp32):
@@ -115,7 +119,7 @@ def main():
         viz.log(step, val_disagreement_fp32=errs.mean().item(), val_seg_term=100 * errs.mean().item())
         with torch.inference_mode():
             m = torch.from_numpy(seg[val_idx[:1]])
-            img = G(m)
+            img = render(G, m, torch.from_numpy(val_idx[:1]))
             out = net.segnet(img).argmax(1)
         vis = np.concatenate([img[0].round().clamp(0, 255).permute(1, 2, 0).byte().numpy(), PALETTE[out[0].numpy()]], 1)
         vis[:, SW:][(out[0] != m[0]).numpy()] = [255, 0, 255]

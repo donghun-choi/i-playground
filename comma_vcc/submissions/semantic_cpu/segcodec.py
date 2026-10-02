@@ -109,7 +109,7 @@ class FastInput:
 
 # ---------------------------------------------------------------- 정수 네트워크
 class QNet:
-    """layers: [(W_q int (o,i,kh,kw), B_q int (o,), M int (o,), pad, relu)]"""
+    """layers: [(W_q int (o,i,kh,kw), B_q int (o,), M int (o,), dil, relu)]  (padding = dil * (k//2))"""
 
     def __init__(self, layers):
         self.layers = layers
@@ -119,9 +119,9 @@ class QNet:
             assert in_max * np.abs(W).sum((1, 2, 3)).max() < 2**24, "float32 정확 범위 초과"
             in_max = 255
         self._t = [(torch.from_numpy(W.astype(np.float32)), torch.from_numpy(B).view(1, -1, 1, 1),
-                    torch.from_numpy(M).view(1, -1, 1, 1), pad, relu) for W, B, M, pad, relu in layers]
+                    torch.from_numpy(M).view(1, -1, 1, 1), dil, relu) for W, B, M, dil, relu in layers]
         # 재양자화를 float64 로: (acc + B) * M 은 2^53 보다 훨씬 작은 정수라 정확, 2^-16 곱도 정확 → floor 는 >> 와 같다
-        self._f = [(W, B.double(), M.double() * 2.0**-SHIFT, pad, relu) for W, B, M, pad, relu in self._t]
+        self._f = [(W, B.double(), M.double() * 2.0**-SHIFT, dil, relu) for W, B, M, dil, relu in self._t]
         self.dtype = torch.float32
 
     def self_check(self, x_q: np.ndarray) -> bool:
@@ -136,8 +136,8 @@ class QNet:
 
     def __call__(self, x_q: np.ndarray) -> np.ndarray:
         x = torch.from_numpy(x_q).to(self.dtype)
-        for W, B, M, pad, relu in self._t:
-            acc = F.conv2d(x, W.to(self.dtype), padding=pad)
+        for W, B, M, dil, relu in self._t:
+            acc = F.conv2d(x, W.to(self.dtype), padding=dil * (W.shape[-1] // 2), dilation=dil)
             acc = acc.round().to(torch.int64)  # 정확한 정수
             y = ((acc + B) * M) >> SHIFT
             if relu:
@@ -148,20 +148,19 @@ class QNet:
     def run(self, x: torch.Tensor) -> torch.Tensor:
         """x: float32 정수값 텐서 → 정수값 logits (float32 텐서). __call__ 과 결과가 같다."""
         x = x.to(self.dtype)
-        for W, B, Ms, pad, relu in self._f:
-            acc = F.conv2d(x, W.to(self.dtype), padding=pad)
-            y = torch.floor((acc.double() + B) * Ms)
+        for W, B, Ms, dil, relu in self._f:
+            y = F.conv2d(x, W.to(self.dtype), padding=dil * (W.shape[-1] // 2), dilation=dil).double().add_(B).mul_(Ms).floor_()
             if relu:
-                y = y.clamp(0, 255)
+                y.clamp_(0, 255)
             x = y.to(self.dtype)
         return x
 
     # 직렬화: 층 수, 각 층 (o,i,k,pad,relu) + W(int8) + B(int32) + M(int32)
     def to_bytes(self) -> bytes:
         out = [struct.pack("<B", len(self.layers))]
-        for W, B, M, pad, relu in self.layers:
+        for W, B, M, dil, relu in self.layers:
             o, i, k, _ = W.shape
-            out.append(struct.pack("<HHBBB", o, i, k, pad, int(relu)))
+            out.append(struct.pack("<HHBBB", o, i, k, dil, int(relu)))
             out.append(W.astype(np.int8).tobytes())
             out.append(B.astype(np.int32).tobytes())
             out.append(M.astype(np.int32).tobytes())
@@ -173,7 +172,8 @@ class QNet:
         off += 1
         layers = []
         for _ in range(n):
-            o, i, k, pad, relu = struct.unpack_from("<HHBBB", buf, off)
+            o, i, k, dil, relu = struct.unpack_from("<HHBBB", buf, off)
+            dil = max(dil, 1)  # 예전 형식은 1x1 층에 0 (padding) 을 적었다
             off += 7
             W = np.frombuffer(buf, np.int8, o * i * k * k, off).reshape(o, i, k, k).astype(np.int64)
             off += o * i * k * k
@@ -181,11 +181,11 @@ class QNet:
             off += 4 * o
             M = np.frombuffer(buf, np.int32, o, off).astype(np.int64)
             off += 4 * o
-            layers.append((W, B, M, pad, bool(relu)))
+            layers.append((W, B, M, dil, bool(relu)))
         return cls(layers), off
 
 
-def quantize_ctxnet(state_dict: dict, calib_inputs: list[np.ndarray], wbits: int = 8) -> QNet:
+def quantize_ctxnet(state_dict: dict, calib_inputs: list[np.ndarray], wbits: int = 8, dils=None) -> QNet:
     """float CtxNet (Conv-ReLU 반복 + 마지막 1x1) → QNet. calib_inputs: build_input_q 결과 몇 개."""
     convs = [(k[: -len(".weight")], v) for k, v in state_dict.items() if k.endswith(".weight")]
     x_float = [torch.from_numpy(x.astype(np.float32)) / Q_IN for x in calib_inputs]  # float 모델 입력 (0..1)
@@ -195,11 +195,12 @@ def quantize_ctxnet(state_dict: dict, calib_inputs: list[np.ndarray], wbits: int
     for li, (name, Wf) in enumerate(convs):
         bf = state_dict[name + ".bias"]
         last = li == len(convs) - 1
-        pad = Wf.shape[-1] // 2
+        dil = 1 if (dils is None or li >= len(dils)) else dils[li]
+        pad = dil * (Wf.shape[-1] // 2)
         s_w = Wf.abs().amax((1, 2, 3)).clamp_min(1e-8) / qmax  # 출력 채널별
         W_q = (Wf / s_w.view(-1, 1, 1, 1)).round().clamp(-qmax, qmax)
         # float 모델로 다음 활성값 범위 측정
-        ys = [F.conv2d(x, Wf, bf, padding=pad) for x in x_float]
+        ys = [F.conv2d(x, Wf, bf, padding=pad, dilation=dil) for x in x_float]
         if last:
             s_out = 1.0 / LOGIT_UNIT
         else:
@@ -210,7 +211,7 @@ def quantize_ctxnet(state_dict: dict, calib_inputs: list[np.ndarray], wbits: int
         unit = s_in * s_w
         B_q = (bf / unit).round()
         M = (unit / s_out * 2**SHIFT).round()
-        layers.append((W_q.numpy().astype(np.int64), B_q.numpy().astype(np.int64), M.numpy().astype(np.int64), pad, not last))
+        layers.append((W_q.numpy().astype(np.int64), B_q.numpy().astype(np.int64), M.numpy().astype(np.int64), dil, not last))
         x_float = [y for y in ys] if not last else x_float
         s_in = s_out
     return QNet(layers)

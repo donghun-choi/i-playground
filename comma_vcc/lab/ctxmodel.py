@@ -36,16 +36,30 @@ def build_input(cur, prev, prev2, s: int, kind: str):
 
 
 class CtxNet(nn.Module):
-    def __init__(self, ch: int = 16, layers: int = 4):
+    def __init__(self, ch: int = 16, layers: int = 4, dils=None):
         super().__init__()
-        mods = [nn.Conv2d(C_IN, ch, 3, padding=1), nn.ReLU()]
-        for _ in range(layers - 1):
-            mods += [nn.Conv2d(ch, ch, 3, padding=1), nn.ReLU()]
+        dils = list(dils) if dils else [1] * layers
+        assert len(dils) == layers
+        self.dils = dils
+        mods = [nn.Conv2d(C_IN, ch, 3, padding=dils[0], dilation=dils[0]), nn.ReLU()]
+        for d in dils[1:]:
+            mods += [nn.Conv2d(ch, ch, 3, padding=d, dilation=d), nn.ReLU()]
         mods += [nn.Conv2d(ch, K, 1)]
         self.net = nn.Sequential(*mods)
 
     def forward(self, x):
         return self.net(x)
+
+
+def load_ctx(path):
+    """체크포인트 → (CtxNet, state_dict, dils). 예전 형식(state_dict 만)도 읽는다."""
+    ck = torch.load(path)
+    sd, dils = (ck["sd"], ck["dils"]) if "sd" in ck else (ck, None)
+    ch = sd["net.0.weight"].shape[0]
+    layers = sum(1 for k in sd if k.endswith(".weight")) - 1
+    m = CtxNet(ch, layers, dils)
+    m.load_state_dict(sd)
+    return m, sd, dils
 
 
 def frame_maps(seg, t):
@@ -79,6 +93,7 @@ def main():
     ap.add_argument("--eval-every", type=int, default=500)
     ap.add_argument("--out", default=str(CACHE / "ctxnet.pt"))
     ap.add_argument("--init", default=None)
+    ap.add_argument("--dils", default=None, help="층별 dilation, 예: 1,2,4,2,1")
     args = ap.parse_args()
 
     from livevis import LiveVis
@@ -87,7 +102,8 @@ def main():
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
     _, seg, _ = load_gt()
-    model = CtxNet(args.ch, args.layers)
+    dils = [int(d) for d in args.dils.split(",")] if args.dils else None
+    model = CtxNet(args.ch, args.layers, dils)
     if args.init:
         model.load_state_dict(torch.load(args.init))
     print(f"ctxnet params {sum(p.numel() for p in model.parameters()):,}", flush=True)
@@ -133,7 +149,7 @@ def main():
             viz.log(step, eval_bytes_per_frame=bpf, **{f"B/frame {k}": v / 8 / len(eval_frames) for k, v in tot.items()})
             print(f"step {step}: {bpf:.0f} B/frame (coarse 제외) ({time.time() - t0:.0f}s) "
                   + " ".join(f"{k}:{v / 8 / len(eval_frames):.0f}" for k, v in tot.items()), flush=True)
-            torch.save(model.state_dict(), args.out)
+            torch.save({"sd": model.state_dict(), "dils": model.dils}, args.out)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,57 @@ class Renderer(nn.Module):
         return torch.sigmoid(self.out(u1)) * 255
 
 
+class _Block(nn.Module):
+    """depthwise(dilation) → pointwise → GroupNorm → 프레임별 FiLM → GELU, 잔차."""
+
+    def __init__(self, w: int, fdim: int, dil: int):
+        super().__init__()
+        self.dw = nn.Conv2d(w, w, 3, padding=dil, dilation=dil, groups=w)
+        self.pw = nn.Conv2d(w, w, 1)
+        self.norm = nn.GroupNorm(max(1, w // 8), w)
+        self.film = nn.Linear(fdim, 2 * w)
+
+    def forward(self, x, f):
+        r = self.norm(self.pw(self.dw(x)))
+        scale, shift = self.film(f).chunk(2, dim=1)
+        return x + F.gelu(r * (1 + scale[:, :, None, None]) + shift[:, :, None, None])
+
+
+class RendererV2(nn.Module):
+    """전해상도 렌더러 (구조는 PR #130 의 semantic renderer 를 참고): 클래스 임베딩 + 좌표 → 블록 4개 → RGB.
+
+    프레임마다 작은 임베딩(fdim)으로 FiLM 변조 → 같은 맵이라도 프레임별로 미세 조정 가능.
+    """
+
+    def __init__(self, width: int = 64, fdim: int = 8, n_frames: int = 600, dils=(1, 1, 2, 4)):
+        super().__init__()
+        self.cfg = (width, fdim, n_frames, tuple(dils))
+        self.embed = nn.Conv2d(5 + 4, width, 1)  # one-hot + (x, y, x², y²)
+        self.frame = nn.Embedding(n_frames, fdim)
+        nn.init.normal_(self.frame.weight, std=0.1)
+        self.blocks = nn.ModuleList([_Block(width, fdim, d) for d in dils])
+        self.head = nn.Conv2d(width, 3, 3, padding=1)
+
+    def forward(self, seg: torch.Tensor, idx: torch.Tensor | None = None) -> torch.Tensor:
+        n = seg.shape[0]
+        c = coords(n)
+        x = torch.cat([F.one_hot(seg.long(), 5).permute(0, 3, 1, 2).float(), c, c * c], 1)
+        x = self.embed(x.contiguous(memory_format=torch.channels_last))
+        f = self.frame(idx if idx is not None else torch.zeros(n, dtype=torch.long))
+        for b in self.blocks:
+            x = b(x, f)
+        return torch.sigmoid(self.head(F.gelu(x))) * 255
+
+
+def make_renderer(cfg) -> nn.Module:
+    """cfg: None/() → v1 Renderer, (width, fdim, n_frames, dils) → RendererV2"""
+    return RendererV2(*cfg) if cfg else Renderer()
+
+
+def render(G: nn.Module, seg: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    return G(seg, idx) if isinstance(G, RendererV2) else G(seg)
+
+
 # ---------------------------------------------------------------- 가중치 직렬화 (int8, 출력 채널별 스케일)
 def pack_state(sd: dict, bits: int = 8) -> bytes:
     """weight: int8 + 채널별 fp32 스케일, bias: fp32. 키 순서는 state_dict 순서를 따른다."""
@@ -169,28 +220,43 @@ def fine_blocks(x: np.ndarray) -> np.ndarray:
     sorted_sums, order = _table()
     combos = torch.from_numpy(_COMBOS).to(torch.int16)
     n = x.shape[0]
-    out = np.zeros((n, SH, SW, 4, 3), np.uint8)
     P = SH * SW
-    for f in range(n):
-        xf = torch.from_numpy(np.ascontiguousarray(x[f], dtype=np.float32)).reshape(P, 3)
-        base = xf.floor().clamp(1, 253)
-        r = (xf - base).contiguous()  # (P,3) in [-1, 2]
-        j = torch.searchsorted(sorted_sums, r).clamp(1, 255)  # (P,3)
-        lo = sorted_sums.gather(1, j - 1)
-        hi = sorted_sums.gather(1, j)
-        j = torch.where((r - lo).abs() <= (hi - r).abs(), j - 1, j)
-        k = order.gather(1, j)  # (P,3) 조합 번호
-        vals = base.to(torch.int16)[:, :, None] + combos[k]  # (P,3,4)
-        out[f] = vals.permute(0, 2, 1).reshape(SH, SW, 4, 3).to(torch.uint8).numpy()
-    return out
+    xf = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)).reshape(n, P, 3).permute(1, 0, 2).reshape(P, n * 3)
+    base = xf.floor().clamp(1, 253)
+    r = (xf - base).contiguous()  # (P, n*3) in [-1, 2]
+    j = torch.searchsorted(sorted_sums, r).clamp(1, 255)
+    lo = sorted_sums.gather(1, j - 1)
+    hi = sorted_sums.gather(1, j)
+    j = torch.where((r - lo).abs() <= (hi - r).abs(), j - 1, j)
+    k = order.gather(1, j)  # (P, n*3) 조합 번호
+    vals = base.to(torch.int16)[:, :, None] + combos[k]  # (P, n*3, 4)
+    return vals.view(P, n, 3, 4).permute(1, 0, 3, 2).reshape(n, SH, SW, 4, 3).to(torch.uint8).numpy()
+
+
+def _full_index() -> np.ndarray:
+    """원해상도 (874*1164) 각 픽셀이 fine_blocks 결과 (384*512*4) 의 어느 값을 복사할지."""
+    def sub(n_in, r0, r1):
+        i_of, a_of = np.full(n_in, -1), np.full(n_in, -1)
+        i_of[r0], a_of[r0] = np.arange(len(r0)), 0
+        i_of[r1], a_of[r1] = np.arange(len(r1)), 1
+        used = np.flatnonzero(i_of >= 0)
+        for r in np.flatnonzero(i_of < 0):  # 안 읽히는 줄: 가까운 줄 값 (아무 값이어도 됨)
+            u = used[np.argmin(np.abs(used - r))]
+            i_of[r], a_of[r] = i_of[u], a_of[u]
+        return i_of, a_of
+
+    ri, ra = sub(H, _R0, _R1)
+    ci, ca = sub(W, _C0, _C1)
+    return ((ri[:, None] * SW + ci[None, :]) * 4 + ra[:, None] * 2 + ca[None, :]).ravel()
+
+
+_FULL = None
 
 
 def expand_fine(x: np.ndarray) -> np.ndarray:
     """(n,384,512,3) float → (n,874,1164,3) uint8. 축소하면 x 에 아주 가깝게 돌아온다."""
-    blk = fine_blocks(x)
-    full = expand(blk[..., 0, :])  # 안 읽히는 줄은 아무 값이어도 되니 b00 으로 채움
-    full[:, _R0[:, None], _C0[None, :]] = blk[..., 0, :]
-    full[:, _R0[:, None], _C1[None, :]] = blk[..., 1, :]
-    full[:, _R1[:, None], _C0[None, :]] = blk[..., 2, :]
-    full[:, _R1[:, None], _C1[None, :]] = blk[..., 3, :]
-    return full
+    global _FULL
+    if _FULL is None:
+        _FULL = torch.from_numpy(_full_index())
+    blk = torch.from_numpy(fine_blocks(x)).reshape(x.shape[0], SH * SW * 4, 3)
+    return blk[:, _FULL].reshape(x.shape[0], H, W, 3).numpy()

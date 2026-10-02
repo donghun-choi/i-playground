@@ -24,10 +24,12 @@ from model import pack_state  # noqa: E402
 
 
 def build_qnet(ckpt: str, seg) -> sc.QNet:
-    sd = torch.load(ckpt)
+    from ctxmodel import load_ctx
+
+    _, sd, dils = load_ctx(ckpt)
     calib = [sc.build_input_q(seg[t : t + 1], seg[t - 1 : t], seg[t - 2 : t - 1], s, k)
              for t in (50, 200, 350, 500) for s in sc.LEVELS for k in "AB"]
-    return sc.quantize_ctxnet(sd, calib)
+    return sc.quantize_ctxnet(sd, calib, dils=dils)
 
 
 def main():
