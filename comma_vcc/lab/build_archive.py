@@ -23,13 +23,13 @@ import segcodec as sc  # noqa: E402
 from model import pack_state  # noqa: E402
 
 
-def build_qnet(ckpt: str, seg) -> sc.QNet:
+def build_qnet(ckpt: str, seg, wbits: int = 8) -> sc.QNet:
     from ctxmodel import load_ctx
 
     _, sd, dils = load_ctx(ckpt)
     calib = [sc.build_input_q(seg[t : t + 1], seg[t - 1 : t], seg[t - 2 : t - 1], s, k)
              for t in (50, 200, 350, 500) for s in sc.LEVELS for k in "AB"]
-    return sc.quantize_ctxnet(sd, calib, dils=dils)
+    return sc.quantize_ctxnet(sd, calib, wbits=wbits, dils=dils)
 
 
 def main():
@@ -43,13 +43,15 @@ def main():
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--renderer-cfg", default=None, help="RendererV2 이면 'width,fdim'")
     ap.add_argument("--rbits", type=int, default=8, help="렌더러 저장 비트 수 (pose_fit 과 같게)")
+    ap.add_argument("--cbits", type=int, default=8, help="문맥 모델 가중치 비트 수")
+    ap.add_argument("--segs-only", action="store_true", help="seg 스트림만 인코드해서 캐시에 저장")
     ap.add_argument("--no-verify", action="store_true", help="seg 디코드 왕복 확인 생략")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     _, seg, _ = load_gt()
 
     t = time.time()
-    q = build_qnet(args.ctx, seg)
+    q = build_qnet(args.ctx, seg, args.cbits)
     ctxn = archive.xz(q.to_bytes())
     if args.pose2:
         seg = np.concatenate([np.load(CACHE / "seg_pre.npy"), seg])
@@ -58,6 +60,9 @@ def main():
     else:
         segs = sc.encode(seg, q)
         open(CACHE / ("segs_pre.bin" if args.pose2 else "segs.bin"), "wb").write(segs)
+    if args.segs_only:
+        print(f"seg 스트림 {len(segs):,} B ({len(segs) / len(seg):.1f} B/frame), 문맥모델 {len(ctxn):,} B", flush=True)
+        return
     print(f"seg 스트림 {len(segs):,} B ({len(segs) / len(seg):.0f} B/frame), 문맥모델 {len(ctxn):,} B ({time.time() - t:.0f}s)", flush=True)
     cfg = None
     if args.renderer_cfg:

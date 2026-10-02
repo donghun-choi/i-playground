@@ -46,6 +46,7 @@ def main():
     ap.add_argument("--fp32-steps", type=int, default=2400)
     ap.add_argument("--q-steps", type=int, default=600)
     ap.add_argument("--cbits", type=int, default=12)
+    ap.add_argument("--bbits", type=int, default=6, help="기저 B 저장 비트 수")
     ap.add_argument("--dimw", type=float, default=0.5)
     ap.add_argument("--bs", type=int, default=24)
     ap.add_argument("--greedy-rounds", type=int, default=2)
@@ -116,8 +117,9 @@ def main():
 
     # ---- B int8 고정, 격자 양자화
     with torch.no_grad():
-        B_scale = B.abs().amax((1, 2, 3)) / 127
-        B_q = (B / B_scale.view(-1, 1, 1, 1)).round().clamp(-127, 127)
+        bq = 2 ** (args.bbits - 1) - 1
+        B_scale = B.abs().amax((1, 2, 3)) / bq
+        B_q = (B / B_scale.view(-1, 1, 1, 1)).round().clamp(-bq, bq)
         B.data = B_q * B_scale.view(-1, 1, 1, 1)
         c_step = ((c.amax(0) - c.amin(0)).clamp_min(1e-6) * 1.2 / 2**args.cbits)
         a_step = ((a.amax(0) - a.amin(0)).clamp_min(1e-6) * 1.2 / 2**args.cbits)

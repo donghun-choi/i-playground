@@ -1,0 +1,146 @@
+"""pose v2 쌍별 파라미터 다듬기: 기저 B 고정, 쌍들을 고정 배치로 나눠 배치마다 따로 Adam → 매 에폭 모든 쌍이 한 번씩 갱신.
+
+(전체 피팅에서는 배치가 무작위라 쌍마다 25스텝에 한 번만 그래디언트를 받아 수렴이 느렸다.)
+마지막에 격자 양자화 + STE 미세조정 + ±1 탐욕 탐색, 평가 경로로 확인.
+
+    python pose_refine.py --pose2 ../cache/pose2_v1r.bin --renderer ../cache/renderer_v1.pt --rbits 6 --out ../cache/pose2_v1r_ref.bin
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+
+import numpy as np
+import torch
+
+from common import CACHE, SH, SW, downsample, load_gt, nets, pose_out
+import archive  # noqa: E402
+from model import even_frames_prev, expand_fine  # noqa: E402
+from pose_fit import renders
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pose2", required=True)
+    ap.add_argument("--renderer", default=str(CACHE / "renderer_v1.pt"))
+    ap.add_argument("--renderer-cfg", default=None)
+    ap.add_argument("--rbits", type=int, default=6)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--epochs", type=int, default=60)
+    ap.add_argument("--q-epochs", type=int, default=15)
+    ap.add_argument("--lr", type=float, default=0.01)
+    ap.add_argument("--cbits", type=int, default=12)
+    ap.add_argument("--greedy-rounds", type=int, default=2)
+    ap.add_argument("--bs", type=int, default=24)
+    ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--port", type=int, default=8014)
+    args = ap.parse_args()
+    from livevis import LiveVis
+
+    torch.set_num_threads(args.threads)
+    net = nets()
+    small, seg, pose = load_gt()
+    n = len(seg)
+    target = torch.from_numpy(pose)
+    pre = np.load(CACHE / "seg_pre.npy")
+    cfg = None
+    if args.renderer_cfg:
+        w, fd = (int(v) for v in args.renderer_cfg.split(","))
+        cfg = (w, fd, n, (1, 1, 2, 4))
+    t0 = time.time()
+    odd, prev = renders(args.renderer, cfg, seg, pre, args.rbits)
+    blob = open(args.pose2, "rb").read()
+    pos = archive.unpack_pose2(blob)
+    B = pos["B"]
+    batches = [torch.arange(i, min(i + args.bs, n)) for i in range(0, n, args.bs)]
+    A = [pos["a"][b].clone().requires_grad_(True) for b in batches]
+    C = [pos["c"][b].clone().requires_grad_(True) for b in batches]
+    viz = LiveVis("comma vcc · pose 쌍별 다듬기", port=args.port).start()
+
+    def evaluate(a, c):
+        with torch.inference_mode():
+            return torch.cat([pose_out(net, even_frames_prev(prev[b], a[j], c[j], B), odd[b]) for j, b in enumerate(batches)]) - target
+
+    def run(epochs, lr, q=None):
+        opts = [torch.optim.Adam([A[j], C[j]], lr=lr) for j in range(len(batches))]
+        for ep in range(epochs):
+            cur_lr = lr * (0.02 + 0.98 * 0.5 * (1 + np.cos(np.pi * ep / max(epochs, 1))))
+            for j, b in enumerate(batches):
+                for g in opts[j].param_groups:
+                    g["lr"] = cur_lr
+                a, c = (A[j], C[j]) if q is None else q(A[j], C[j])
+                out = pose_out(net, even_frames_prev(prev[b], a, c, B), odd[b])
+                loss = ((out - target[b]) ** 2).sum()
+                opts[j].zero_grad()
+                loss.backward()
+                opts[j].step()
+            if ep % 5 == 4 or ep == epochs - 1:
+                aa = [x.detach() for x in A]
+                cc = [x.detach() for x in C]
+                if q is not None:
+                    aa, cc = zip(*[q(x, y) for x, y in zip(aa, cc)])
+                err = evaluate(aa, cc)
+                d = err.pow(2).mean().item()
+                viz.log(ep, posenet_dist=d, pose_term=float(np.sqrt(10 * d)))
+                print(f"epoch {ep + 1}: posenet_dist {d:.7f} term {np.sqrt(10 * d):.4f} 차원별 RMS {err.pow(2).mean(0).sqrt().numpy().round(4)} ({time.time() - t0:.0f}s)", flush=True)
+
+    run(args.epochs, args.lr)
+
+    # 격자 양자화
+    with torch.no_grad():
+        a_all, c_all = torch.cat([x.detach() for x in A]), torch.cat([x.detach() for x in C])
+        a_step = (a_all.amax(0) - a_all.amin(0)).clamp_min(1e-6) * 1.2 / 2**args.cbits
+        c_step = (c_all.amax(0) - c_all.amin(0)).clamp_min(1e-6) * 1.2 / 2**args.cbits
+
+    def q(a, c):
+        return a + ((a / a_step).round() * a_step - a).detach(), c + ((c / c_step).round() * c_step - c).detach()
+
+    run(args.q_epochs, args.lr * 0.1, q=q)
+
+    with torch.no_grad():
+        a_int = torch.cat([(x.detach() / a_step).round() for x in A])
+        c_int = torch.cat([(x.detach() / c_step).round() for x in C])
+
+        def dist(ai, ci):
+            return evaluate([ai[b] * a_step for b in batches], [ci[b] * c_step for b in batches]).pow(2).mean(1)
+
+        d = dist(a_int, c_int)
+        print(f"양자화 후 posenet_dist {d.mean():.7f}", flush=True)
+        for rnd in range(args.greedy_rounds):
+            for which in ("a", "c"):
+                vec = a_int if which == "a" else c_int
+                for kd in range(vec.shape[1]):
+                    for sgn in (1, -1):
+                        cand = vec.clone()
+                        cand[:, kd] += sgn
+                        dn = dist(cand, c_int) if which == "a" else dist(a_int, cand)
+                        better = dn < d
+                        vec[better] = cand[better]
+                        d[better] = dn[better]
+            print(f"탐욕 탐색 {rnd + 1}: posenet_dist {d.mean():.7f} term {np.sqrt(10 * d.mean()):.4f} ({time.time() - t0:.0f}s)", flush=True)
+
+    # B 는 원래 blob 의 정수 그대로 다시 쓴다
+    import struct
+
+    nn_, k, Cc, bh, bw = struct.unpack_from("<HHBHH", blob, 0)
+    body = archive.unxz(blob[struct.calcsize("<HHBHH"):])
+    B_scale = np.frombuffer(body, np.float32, k, 4 * (k + 6))
+    B_q = np.frombuffer(body, np.int8, k * Cc * bh * bw, 4 * (2 * k + 6)).reshape(k, Cc, bh, bw)
+    out = archive.pack_pose2(B_q, B_scale, c_int.numpy().astype(np.int64), c_step.numpy(), a_int.numpy().astype(np.int64), a_step.numpy())
+    open(args.out, "wb").write(out)
+    pos2 = archive.unpack_pose2(out)
+    assert torch.allclose(pos2["B"], B)
+    dd = []
+    with torch.inference_mode():
+        for i in range(0, n, 20):
+            e = even_frames_prev(prev[i : i + 20], pos2["a"][i : i + 20], pos2["c"][i : i + 20], pos2["B"])
+            pair = torch.stack([e, odd[i : i + 20]], 1).flatten(0, 1).permute(0, 2, 3, 1).numpy()
+            back = downsample(torch.from_numpy(expand_fine(pair))).view(-1, 2, 3, SH, SW)
+            dd.append(((pose_out(net, back[:, 0], back[:, 1]) - target[i : i + 20]) ** 2).mean(1))
+    d2 = torch.cat(dd).mean().item()
+    print(f"pose2 {len(out):,} B, 평가 경로 posenet_dist {d2:.7f} term {np.sqrt(10 * d2):.4f} ({time.time() - t0:.0f}s)", flush=True)
+
+
+if __name__ == "__main__":
+    main()
