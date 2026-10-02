@@ -108,3 +108,4 @@ archive = [seg 맵 600장 (무손실)] + [렌더러] + [pose carrier]
 | baseline_fast (재현) | 0.00947 | 0.380 | 0.0598 | 4.39 | x265 ultrafast crf30, 45% 축소, 평가 227s (CPU 4코어) |
 | semantic_cpu v1 | 0.00153 | 0.00067 | 0.00650 | **0.397** | seg맵 142KB + 문맥모델 23KB + 렌더러 42KB + carrier 36KB, inflate 740s + 평가 251s (4코어) |
 | semantic_cpu v2 | 0.00153 | 0.00030 | 0.00561 | **0.3485** | seg맵 129KB(dilation 6비트 문맥모델 17KB) + 렌더러 6비트 30KB + pose(이전 렌더+아핀+carrier) 35KB, inflate 337s + 평가 224s |
+| semantic_cpu v3 | 0.00144 | 0.00037 | 0.00543 | **0.3403** | 렌더러 fp32 미세조정, 문맥모델 추가 학습(193 B/frame), pose 재다듬기(계수 10비트). inflate 334s + 평가 231s |

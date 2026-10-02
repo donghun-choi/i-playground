@@ -105,7 +105,8 @@ def main():
     dils = [int(d) for d in args.dils.split(",")] if args.dils else None
     model = CtxNet(args.ch, args.layers, dils)
     if args.init:
-        model.load_state_dict(torch.load(args.init))
+        ck = torch.load(args.init)
+        model.load_state_dict(ck["sd"] if "sd" in ck else ck)
     print(f"ctxnet params {sum(p.numel() for p in model.parameters()):,}", flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=args.steps, pct_start=0.05)
