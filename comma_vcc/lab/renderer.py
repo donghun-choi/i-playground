@@ -19,7 +19,7 @@ from PIL import Image
 from common import CACHE, SH, SW, load_gt, nets
 import copy
 
-from model import Renderer, make_renderer, quantize_roundtrip, render  # noqa: E402  (제출물 패키지와 같은 정의)
+from model import Renderer, fake_quant_, make_renderer, quantize_roundtrip, render  # noqa: E402  (제출물 패키지와 같은 정의)
 
 PALETTE = np.array([[64, 64, 64], [230, 230, 230], [42, 120, 214], [12, 163, 12], [208, 59, 59]], np.uint8)
 
@@ -36,10 +36,10 @@ def png(arr: np.ndarray) -> bytes:
 
 
 @torch.inference_mode()
-def evaluate(G, net, seg, idx, bs=8, rounded=False):
-    """inflate 와 같은 조건: int8 왕복 가중치, float 출력 (서브픽셀 확장으로 거의 그대로 전달된다)."""
+def evaluate(G, net, seg, idx, bs=8, rounded=False, bits=8):
+    """inflate 와 같은 조건: 저장/복원 왕복 가중치, float 출력 (서브픽셀 확장으로 거의 그대로 전달된다)."""
     Gq = copy.deepcopy(G)
-    quantize_roundtrip(Gq)
+    quantize_roundtrip(Gq, bits)
     errs = []
     for i in range(0, len(idx), bs):
         m = torch.from_numpy(seg[idx[i : i + bs]])
@@ -64,6 +64,8 @@ def main():
     ap.add_argument("--arch", default="v1", help="v1 | v2 (전해상도 + 프레임별 FiLM)")
     ap.add_argument("--width", type=int, default=48)
     ap.add_argument("--fdim", type=int, default=8)
+    ap.add_argument("--bits", type=int, default=8, help="저장 비트 수 (평가에 반영)")
+    ap.add_argument("--project", action="store_true", help="스텝마다 가중치를 --bits 격자로 투영 (양자화 인지 미세조정)")
     ap.add_argument("--full-eval", action="store_true", help="끝나고 600장 전체 평가")
     args = ap.parse_args()
 
@@ -108,6 +110,8 @@ def main():
             opt.zero_grad()
             loss.backward()
             opt.step()
+            if args.project:
+                fake_quant_(G, args.bits)
             sched.step()
             step += 1
             with torch.no_grad():
@@ -115,7 +119,7 @@ def main():
             viz.log(step, loss=loss.item(), train_disagreement_bf16=err, lr=sched.get_last_lr()[0])
             if step % 50 == 0:
                 print(f"ep {ep} step {step}/{steps} loss {loss.item():.4f} err {err:.5f} ({time.time() - t0:.0f}s)", flush=True)
-        errs = evaluate(G, net, seg, val_idx)
+        errs = evaluate(G, net, seg, val_idx, bits=args.bits)
         viz.log(step, val_disagreement_fp32=errs.mean().item(), val_seg_term=100 * errs.mean().item())
         with torch.inference_mode():
             m = torch.from_numpy(seg[val_idx[:1]])
@@ -127,7 +131,7 @@ def main():
         torch.save(G.state_dict(), args.out)
         print(f"== epoch {ep} val disagreement {errs.mean():.5f} (max {errs.max():.5f})", flush=True)
     if args.full_eval:
-        errs = evaluate(G, net, seg, np.arange(len(seg)))
+        errs = evaluate(G, net, seg, np.arange(len(seg)), bits=args.bits)
         print(f"== 전체 600장 disagreement {errs.mean():.6f} → seg 항 {100 * errs.mean():.4f}", flush=True)
 
 

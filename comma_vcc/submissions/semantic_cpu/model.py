@@ -96,43 +96,58 @@ def render(G: nn.Module, seg: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
 
 # ---------------------------------------------------------------- 가중치 직렬화 (int8, 출력 채널별 스케일)
 def pack_state(sd: dict, bits: int = 8) -> bytes:
-    """weight: int8 + 채널별 fp32 스케일, bias: fp32. 키 순서는 state_dict 순서를 따른다."""
+    """weight(2차원 이상): bits 비트 정수(int8 바이트에 저장) + 출력 채널별 fp16 스케일, 1차원: fp16.
+
+    값의 가짓수가 적을수록 lzma 가 잘 줄인다 (archive 에서 섹션 전체를 xz 로 압축).
+    """
+    out = [struct.pack("<HB", len(sd), bits)]
     qmax = 2 ** (bits - 1) - 1
-    out = [struct.pack("<H", len(sd))]
     for k, v in sd.items():
         v = v.detach().float()
         if v.ndim >= 2:
-            s = v.abs().reshape(v.shape[0], -1).amax(1).clamp_min(1e-12) / qmax
+            s = (v.abs().reshape(v.shape[0], -1).amax(1).clamp_min(1e-8) / qmax).half().float()
             q = (v / s.view(-1, *[1] * (v.ndim - 1))).round().clamp(-qmax, qmax).to(torch.int8)
-            out.append(struct.pack("<B", 1) + s.numpy().astype(np.float32).tobytes() + q.numpy().tobytes())
+            out.append(struct.pack("<B", 1) + s.half().numpy().tobytes() + q.numpy().tobytes())
         else:
-            out.append(struct.pack("<B", 0) + v.numpy().astype(np.float32).tobytes())
+            out.append(struct.pack("<B", 0) + v.half().numpy().tobytes())
     return b"".join(out)
 
 
 def unpack_state(buf: bytes, template: dict) -> dict:
-    (n,) = struct.unpack_from("<H", buf, 0)
-    off = 2
+    n, _bits = struct.unpack_from("<HB", buf, 0)
+    off = 3
     sd = {}
     assert n == len(template)
     for k, v in template.items():
         (kind,) = struct.unpack_from("<B", buf, off)
         off += 1
         if kind == 1:
-            s = np.frombuffer(buf, np.float32, v.shape[0], off)
-            off += 4 * v.shape[0]
+            s = np.frombuffer(buf, np.float16, v.shape[0], off).astype(np.float32)
+            off += 2 * v.shape[0]
             q = np.frombuffer(buf, np.int8, v.numel(), off).reshape(v.shape)
             off += v.numel()
             sd[k] = torch.from_numpy(q.astype(np.float32) * s.reshape(-1, *[1] * (v.ndim - 1)))
         else:
-            sd[k] = torch.from_numpy(np.frombuffer(buf, np.float32, v.numel(), off).reshape(v.shape).copy())
-            off += 4 * v.numel()
+            sd[k] = torch.from_numpy(np.frombuffer(buf, np.float16, v.numel(), off).astype(np.float32).reshape(v.shape))
+            off += 2 * v.numel()
     return sd
 
 
-def quantize_roundtrip(module: nn.Module) -> None:
-    """모듈 가중치를 int8 왕복 값으로 바꾼다 (inflate 와 같은 가중치로 평가/미세조정하기 위해)."""
-    module.load_state_dict(unpack_state(pack_state(module.state_dict()), module.state_dict()))
+def fake_quant_(module: nn.Module, bits: int) -> None:
+    """양자화 인지 학습용: 2차원 이상 가중치를 bits 비트 격자 값으로 덮어쓴다 (pack_state 와 같은 규칙)."""
+    qmax = 2 ** (bits - 1) - 1
+    with torch.no_grad():
+        for p in module.parameters():
+            if p.ndim >= 2:
+                s = (p.abs().reshape(p.shape[0], -1).amax(1).clamp_min(1e-8) / qmax).half().float()
+                p.copy_((p / s.view(-1, *[1] * (p.ndim - 1))).round().clamp(-qmax, qmax) * s.view(-1, *[1] * (p.ndim - 1)))
+            else:
+                p.copy_(p.half().float())
+
+
+def quantize_roundtrip(module: nn.Module, bits: int = 8) -> None:
+    """모듈 가중치를 저장/복원 왕복 값으로 바꾼다 (inflate 와 같은 가중치로 평가/미세조정하기 위해)."""
+    module.load_state_dict(unpack_state(pack_state(module.state_dict(), bits), module.state_dict()))
 
 
 # ---------------------------------------------------------------- pose carrier: 짝수 프레임
@@ -148,6 +163,22 @@ def even_frames(odd: torch.Tensor, c: torch.Tensor, B: torch.Tensor, base: str =
     """짝수 프레임 (float, 0..255). base: 'gray' (127.5) 또는 'odd' (같은 쌍 홀수 프레임)."""
     b = odd if base == "odd" else torch.full_like(odd, GRAY)
     return (b + carrier_delta(c, B, mode)).clamp(0, 255)
+
+
+AFF_SCALE = torch.tensor([0.01, 0.01, 2 / SW, 0.01, 0.01, 2 / SH])  # 행렬 원소 0.01 단위, 이동 픽셀 단위
+
+
+def affine(img: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    """img (n,3,H,W), a (n,6) = [a11-1, a12, tx(px), a21, a22-1, ty(px)] (스케일 전) → bilinear 재샘플."""
+    a = a * AFF_SCALE
+    th = torch.stack([torch.stack([1 + a[:, 0], a[:, 1], a[:, 2]], 1), torch.stack([a[:, 3], 1 + a[:, 4], a[:, 5]], 1)], 1)
+    g = F.affine_grid(th, list(img.shape), align_corners=False)
+    return F.grid_sample(img, g, mode="bilinear", padding_mode="border", align_corners=False)
+
+
+def even_frames_prev(prev: torch.Tensor, a: torch.Tensor, c: torch.Tensor, B: torch.Tensor, mode: str = "bicubic") -> torch.Tensor:
+    """짝수 프레임 = 아핀(이전 쌍 홀수 프레임) + carrier. PoseNet 을 자연스러운 운동 상태에 둔다."""
+    return (affine(prev, a) + carrier_delta(c, B, mode)).clamp(0, 255)
 
 
 # ---------------------------------------------------------------- 512x384 → 1164x874

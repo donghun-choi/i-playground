@@ -88,3 +88,61 @@ def dct_basis(k: int, bh: int, bw: int) -> torch.Tensor:
     x = (torch.arange(bw, dtype=torch.float64) + 0.5) / bw
     B = torch.stack([(torch.cos(torch.pi * u * y)[:, None] * torch.cos(torch.pi * v * x)[None, :])[None] for u, v in freqs])
     return (B * 30).float()
+
+
+# ---------------------------------------------------------------- 렌더러
+# 헤더: arch(1 = v1 Renderer, 2 = RendererV2), v2 이면 width, fdim, n_frames, dilation 4개
+def pack_renderer(cfg, weights: bytes) -> bytes:
+    if not cfg:
+        head = struct.pack("<B", 1)
+    else:
+        width, fdim, n_frames, dils = cfg
+        head = struct.pack("<BHBH4B", 2, width, fdim, n_frames, *dils)
+    return head + xz(weights)
+
+
+def unpack_renderer(buf: bytes):
+    """→ (cfg, weights bytes)"""
+    if buf[0] == 1:
+        return None, unxz(buf[1:])
+    _, width, fdim, n_frames, *dils = struct.unpack_from("<BHBH4B", buf, 0)
+    return (width, fdim, n_frames, tuple(dils)), unxz(buf[struct.calcsize("<BHBH4B"):])
+
+
+# ---------------------------------------------------------------- pose v2: 이전 렌더 + 아핀 + carrier
+# 헤더: n, k, C, bh, bw. 본문(xz): c 간격(k) + a 간격(6) + B 스케일(k) + B int8 + c int16 차분 + a int16 차분
+def pack_pose2(B_q, B_scale, c_int, c_step, a_int, a_step) -> bytes:
+    n, k = c_int.shape
+    _, C, bh, bw = B_q.shape
+    head = struct.pack("<HHBHH", n, k, C, bh, bw)
+
+    def deltas(x):
+        d = np.diff(x, axis=0, prepend=np.zeros((1, x.shape[1]), x.dtype))
+        assert np.abs(d).max() < 32768
+        return np.ascontiguousarray(d.astype(np.int16).T).tobytes()
+
+    body = [c_step.astype(np.float32).tobytes(), a_step.astype(np.float32).tobytes(),
+            B_scale.astype(np.float32).tobytes(), B_q.astype(np.int8).tobytes(), deltas(c_int), deltas(a_int)]
+    return head + xz(b"".join(body))
+
+
+def unpack_pose2(buf: bytes):
+    n, k, C, bh, bw = struct.unpack_from("<HHBHH", buf, 0)
+    body = unxz(buf[struct.calcsize("<HHBHH"):])
+    off = 0
+
+    def take(dtype, count):
+        nonlocal off
+        x = np.frombuffer(body, dtype, count, off)
+        off += x.nbytes
+        return x
+
+    c_step, a_step, B_scale = take(np.float32, k), take(np.float32, 6), take(np.float32, k)
+    B_q = take(np.int8, k * C * bh * bw).reshape(k, C, bh, bw)
+    c_int = np.cumsum(take(np.int16, n * k).reshape(k, n).T.astype(np.int64), axis=0)
+    a_int = np.cumsum(take(np.int16, n * 6).reshape(6, n).T.astype(np.int64), axis=0)
+    return {
+        "B": torch.from_numpy(B_q.astype(np.float32) * B_scale.reshape(k, 1, 1, 1)),
+        "c": torch.from_numpy((c_int * c_step.astype(np.float64)).astype(np.float32)),
+        "a": torch.from_numpy((a_int * a_step.astype(np.float64)).astype(np.float32)),
+    }

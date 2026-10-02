@@ -40,6 +40,7 @@ def main():
     ap.add_argument("--bs", type=int, default=16)
     ap.add_argument("--lr", type=float, default=0.05)
     ap.add_argument("--threads", type=int, default=1)
+    ap.add_argument("--dimw", type=float, default=0.0, help="차원별 가중 (1/분산)^dimw")
     ap.add_argument("--rgb", action="store_true", help="기저를 RGB 3채널로 (기본: 회색 1채널)")
     ap.add_argument("--binit", type=float, default=5.0)
     ap.add_argument("--dct", action="store_true", help="학습 기저 대신 고정 DCT 기저 (저장 비용 0)")
@@ -54,13 +55,20 @@ def main():
     small, seg, pose = load_gt()
     idx = np.linspace(1, 599, args.pairs).astype(int)
     odd = torch.from_numpy(np.stack([small[2 * i + 1] for i in idx])).round()
-    if args.base == "odd":
+    shift = None
+    if args.base in ("oddshift", "oddaffine"):
+        base = odd.clone()
+        # 쌍별 아핀: [a11-1, a12, tx(px), a21, a22-1, ty(px)] (oddshift 는 tx, ty 만 학습)
+        shift = torch.zeros(len(idx), 6, requires_grad=True)
+    elif args.base == "odd":
         base = odd.clone()
     elif args.base == "prevodd":
         base = torch.from_numpy(np.stack([small[2 * i - 1] for i in idx])).round()
     else:
         base = torch.full_like(odd, 128.0)
     target = torch.from_numpy(pose[idx])
+    wdim = torch.from_numpy(pose).var(0).clamp_min(1e-8) ** (-args.dimw)
+    wdim = wdim / wdim.mean()
     bh, bw = SH // args.bres, SW // args.bres
     if args.dct:
         B = dct_basis(args.k, bh, bw) * 30
@@ -70,16 +78,31 @@ def main():
         B = (torch.randn(args.k, 3 if args.rgb else 1, bh, bw) * args.binit).requires_grad_(True)
         c = (torch.randn(len(idx), args.k) * 0.3).requires_grad_(True)
         opt = torch.optim.Adam([{"params": [B], "lr": args.lr * 20}, {"params": [c], "lr": args.lr}])
+    if shift is not None:
+        opt.add_param_group({"params": [shift], "lr": 0.02})
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.steps, eta_min=args.lr * 0.02)
+
+    def base_of(sel):
+        if shift is None:
+            return base[sel]
+        n_ = len(sel)
+        a = shift[sel]
+        if args.base == "oddshift":
+            a = a * torch.tensor([0, 0, 1, 0, 0, 1.0])
+        sc = torch.tensor([0.01, 0.01, 2 / SW, 0.01, 0.01, 2 / SH])  # 행렬 원소는 0.01 단위, 이동은 픽셀 단위
+        a = a * sc
+        th = torch.stack([torch.stack([1 + a[:, 0], a[:, 1], a[:, 2]], 1), torch.stack([a[:, 3], 1 + a[:, 4], a[:, 5]], 1)], 1)
+        grid = F.affine_grid(th, (n_, 3, SH, SW), align_corners=False)
+        return F.grid_sample(base[sel], grid, mode="bilinear", padding_mode="border", align_corners=False)
     viz = LiveVis(f"comma vcc · carrier base={args.base} k={args.k} bres={args.bres}", port=args.port).start()
     t0 = time.time()
     for step in range(1, args.steps + 1):
         perm = torch.randperm(len(idx))[: args.bs]
         delta = F.interpolate(torch.einsum("nk,kchw->nchw", c[perm], B), size=(SH, SW), mode="bicubic")
-        even = ste_round((base[perm] + delta).clamp(0, 255))
+        even = ste_round((base_of(perm) + delta).clamp(0, 255))
         with torch.autocast("cpu", dtype=torch.bfloat16, enabled=step < args.fp32_after):
             out = pose_out(net, even, odd[perm])
-        loss = ((out.float() - target[perm]) ** 2).mean()
+        loss = (((out.float() - target[perm]) ** 2) * wdim).mean()
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -88,8 +111,10 @@ def main():
         if step % 50 == 0 or step == args.steps:
             with torch.inference_mode():
                 delta = F.interpolate(torch.einsum("nk,kchw->nchw", c, B), size=(SH, SW), mode="bicubic")
-                even = (base + delta).clamp(0, 255).round()
-                d = ((pose_out(net, even, odd) - target) ** 2).mean().item()
+                even = (base_of(torch.arange(len(idx))) + delta).clamp(0, 255).round()
+                err = (pose_out(net, even, odd) - target) ** 2
+                d = err.mean().item()
+                print("   차원별 RMS", err.mean(0).sqrt().numpy().round(4), flush=True)
             viz.log(step, posenet_dist_fp32=d, pose_term=float(np.sqrt(10 * d)))
             print(f"step {step}: posenet_dist {d:.6f} term {np.sqrt(10 * d):.4f} |c| {c.abs().mean():.3f} "
                   f"|delta| {delta.abs().mean():.2f} ({time.time() - t0:.0f}s)", flush=True)

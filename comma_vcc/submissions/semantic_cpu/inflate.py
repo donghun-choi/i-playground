@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 
 import archive  # noqa: E402
 import segcodec  # noqa: E402
-from model import Renderer, even_frames, expand_fine, unpack_state  # noqa: E402
+from model import even_frames, even_frames_prev, expand_fine, make_renderer, render, unpack_state  # noqa: E402
 
 
 def log(msg):
@@ -39,20 +39,37 @@ def reconstruct(p: bytes, batch: int = 8):
     seg = segcodec.decode(sec["segs"], qnet)
     log(f"seg 맵 {len(seg)}장 복호화 {time.time() - t:.0f}s")
 
-    G = Renderer()
-    G.load_state_dict(unpack_state(archive.unxz(sec["rend"]), G.state_dict()))
+    cfg, wbytes = archive.unpack_renderer(sec["rend"])
+    G = make_renderer(cfg)
+    G.load_state_dict(unpack_state(wbytes, G.state_dict()))
     G.eval()
-    car = archive.unpack_carrier(sec["carr"])
-    n = len(seg)
-    odd = np.zeros((n, 384, 512, 3), np.float32)
-    even = np.zeros((n, 384, 512, 3), np.float32)
     t = time.time()
     with torch.inference_mode():
-        for i in range(0, n, batch):
-            o = G(torch.from_numpy(seg[i : i + batch]))
-            e = even_frames(o, car["c"][i : i + batch], car["B"], car["base"], car["mode"])
-            odd[i : i + batch] = o.permute(0, 2, 3, 1).numpy()
-            even[i : i + batch] = e.permute(0, 2, 3, 1).numpy()
+        if "pos2" in sec:
+            # seg 스트림 맨 앞 한 장은 첫 쌍의 '이전 프레임' 용 맵
+            pre, seg = seg[:1], seg[1:]
+            n = len(seg)
+            odd_t = torch.zeros(n, 3, 384, 512)
+            for i in range(0, n, batch):
+                odd_t[i : i + batch] = render(G, torch.from_numpy(seg[i : i + batch]), torch.arange(i, min(i + batch, n)))
+            prev0 = render(G, torch.from_numpy(pre), torch.zeros(1, dtype=torch.long))
+            pos = archive.unpack_pose2(sec["pos2"])
+            even = np.zeros((n, 384, 512, 3), np.float32)
+            for i in range(0, n, batch):
+                prev = torch.cat([prev0, odd_t[: min(i + batch, n) - 1]]) if i == 0 else odd_t[i - 1 : min(i + batch, n) - 1]
+                e = even_frames_prev(prev, pos["a"][i : i + batch], pos["c"][i : i + batch], pos["B"])
+                even[i : i + batch] = e.permute(0, 2, 3, 1).numpy()
+            odd = odd_t.permute(0, 2, 3, 1).contiguous().numpy()
+        else:
+            car = archive.unpack_carrier(sec["carr"])
+            n = len(seg)
+            odd = np.zeros((n, 384, 512, 3), np.float32)
+            even = np.zeros((n, 384, 512, 3), np.float32)
+            for i in range(0, n, batch):
+                o = render(G, torch.from_numpy(seg[i : i + batch]), torch.arange(i, min(i + batch, n)))
+                e = even_frames(o, car["c"][i : i + batch], car["B"], car["base"], car["mode"])
+                odd[i : i + batch] = o.permute(0, 2, 3, 1).numpy()
+                even[i : i + batch] = e.permute(0, 2, 3, 1).numpy()
     log(f"렌더링 {time.time() - t:.0f}s")
     return even, odd
 

@@ -19,18 +19,19 @@ import torch
 
 from common import CACHE, SH, SW, downsample, load_gt, nets, pose_out
 import archive  # noqa: E402
-from model import Renderer, even_frames, expand_fine, quantize_roundtrip  # noqa: E402
+from model import even_frames, expand_fine, make_renderer, quantize_roundtrip, render  # noqa: E402
 
 
 @torch.inference_mode()
-def render_odd(renderer_path, seg, bs=8):
-    G = Renderer()
+def render_odd(renderer_path, seg, cfg=None, bs=8):
+    """inflate 와 같은 홀수 프레임: int8 왕복 렌더러, float 출력."""
+    G = make_renderer(cfg)
     G.load_state_dict(torch.load(renderer_path))
     quantize_roundtrip(G)
     G.eval()
     out = torch.zeros(len(seg), 3, SH, SW)
     for i in range(0, len(seg), bs):
-        out[i : i + bs] = G(torch.from_numpy(seg[i : i + bs]))
+        out[i : i + bs] = render(G, torch.from_numpy(seg[i : i + bs]), torch.arange(i, min(i + bs, len(seg))))
     return out
 
 
@@ -75,6 +76,9 @@ def main():
     ap.add_argument("--lr", type=float, default=0.05)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--port", type=int, default=8005)
+    ap.add_argument("--dimw", type=float, default=0.0, help="차원별 가중치 = (1/분산)^dimw 정규화. 0 이면 평가와 같은 MSE")
+    ap.add_argument("--init", default=None, help="기존 carrier.bin 에서 B, c 로 시작 (렌더러가 바뀌었을 때)")
+    ap.add_argument("--renderer-cfg", default=None, help="RendererV2 이면 'width,fdim'")
     args = ap.parse_args()
     from livevis import LiveVis
 
@@ -86,14 +90,27 @@ def main():
     n = len(seg)
     viz = LiveVis(f"comma vcc · carrier 피팅 base={args.base} k={args.k} {args.ch}x{args.bh}x{args.bw}", port=args.port).start()
     t0 = time.time()
-    odd = render_odd(args.renderer, seg)
+    cfg = None
+    if args.renderer_cfg:
+        w, fd = (int(v) for v in args.renderer_cfg.split(","))
+        cfg = (w, fd, n, (1, 1, 2, 4))
+    odd = render_odd(args.renderer, seg, cfg)
     print(f"홀수 프레임 렌더 {time.time() - t0:.0f}s", flush=True)
 
-    B = (torch.randn(args.k, args.ch, args.bh, args.bw) * args.binit).requires_grad_(True)
-    c = (torch.randn(n, args.k) * 0.3).requires_grad_(True)
+    if args.init:
+        car = archive.unpack_carrier(open(args.init, "rb").read())
+        B = car["B"].clone().requires_grad_(True)
+        c = car["c"].clone().requires_grad_(True)
+        print(f"초기값: {args.init} posenet_dist {pose_dist(net, odd, c.detach(), B.detach(), target, args.base).mean():.7f}", flush=True)
+    else:
+        B = (torch.randn(args.k, args.ch, args.bh, args.bw) * args.binit).requires_grad_(True)
+        c = (torch.randn(n, args.k) * 0.3).requires_grad_(True)
     step = 0
+    # 차원별 가중치: pose 0번(전진)의 분산이 나머지보다 ~1000배 커서 그냥 MSE 면 회전 차원을 못 배운다
+    wdim = target.var(0).clamp_min(1e-8) ** (-args.dimw)
+    wdim = wdim / wdim.mean()
 
-    def train(n_steps, bf16, groups, cq=None):
+    def train(n_steps, bf16, groups, cq=None, weighted=True):
         nonlocal step
         opt = torch.optim.Adam(groups)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, n_steps, eta_min=groups[-1]["lr"] * 0.01)
@@ -104,7 +121,8 @@ def main():
             even = even_frames(odd[perm], cc, B, args.base)
             with torch.autocast("cpu", dtype=torch.bfloat16, enabled=bf16):
                 out = pose_out(net, even, odd[perm])
-            loss = ((out.float() - target[perm]) ** 2).mean()
+            w = wdim if weighted else torch.ones(6)
+            loss = (((out.float() - target[perm]) ** 2) * w).mean()
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -131,7 +149,7 @@ def main():
     def cq(x):  # 격자 양자화 (STE)
         return x + ((x / qs).round() * qs - x).detach()
 
-    train(args.q_steps, False, [{"params": [c], "lr": args.lr * 0.1}], cq=cq)
+    train(args.q_steps, False, [{"params": [c], "lr": args.lr * 0.1}], cq=cq, weighted=False)
 
     # ---- 쌍별 탐욕 탐색: 격자 ±1 칸씩
     with torch.no_grad():
