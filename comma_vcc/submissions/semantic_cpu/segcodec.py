@@ -226,6 +226,16 @@ def probs_from_logits(logit_q: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(f / f.sum(1, keepdims=True))
 
 
+_EXP_T = torch.from_numpy(EXP_TABLE.astype(np.float64))
+
+
+def probs_from_logits_t(logit: torch.Tensor) -> np.ndarray:
+    """probs_from_logits 와 같은 값 (torch, 멀티스레드). logit: (n,5) 정수값 텐서."""
+    d = (logit.amax(1, keepdim=True) - logit).clamp_(max=255).long()
+    f = _EXP_T[d]
+    return (f / f.sum(1, keepdim=True)).contiguous().numpy()
+
+
 # ---------------------------------------------------------------- coarse 격자 (적응형 카운트)
 def coarse_pos():
     ys, xs = np.mgrid[0:SH:LEVELS[0], 0:SW:LEVELS[0]]
@@ -325,7 +335,7 @@ def decode(buf: bytes, qnet: QNet, progress=None) -> np.ndarray:
                 for kind in "AB":
                     _, tg = fi.known[h, kind]
                     logit = qnet.run(fi.build(cur, s, kind, fp, fp2))[0]  # (5,gh,gw)
-                    p = probs_from_logits(logit[:, tg].T.to(torch.int64).numpy())
+                    p = probs_from_logits_t(logit[:, tg].T)
                     g = cur[0, ::h, ::h]  # view
                     g[tg] = torch.from_numpy(dec.decode(fam, p).astype(np.uint8))
             fp2, fp = fp, fi.fracs(cur, 1)

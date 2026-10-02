@@ -26,13 +26,17 @@ def main():
     ap.add_argument("--bs", type=int, default=4)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--renderer", default=str(CACHE / "renderer_v1.pt"))
+    ap.add_argument("--lr-decay", type=float, default=1.0, help="스텝마다 lr 곱")
+    ap.add_argument("--loss", default="hinge", help="hinge | ce")
+    ap.add_argument("--rbits", type=int, default=6)
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     net = nets()
     _, seg, _ = load_gt()
     G = Renderer()
     G.load_state_dict(torch.load(args.renderer))
-    quantize_roundtrip(G)
+    quantize_roundtrip(G, args.rbits)
+    net.segnet.to(memory_format=torch.channels_last)
     G.eval()
     idx = np.linspace(0, 599, args.frames).astype(int)
     errs = np.zeros(args.steps + 1)
@@ -51,11 +55,14 @@ def main():
                 break
             true = logits.gather(1, m[:, None])[:, 0]
             other = logits.scatter(1, m[:, None], -1e4).amax(1)
-            loss = F.relu(args.margin - (true - other)).sum()
+            if args.loss == "ce":
+                loss = F.cross_entropy(logits, m, reduction="sum")
+            else:
+                loss = F.relu(args.margin - (true - other)).sum()
             (g,) = torch.autograd.grad(loss, x)
             with torch.no_grad():
                 # 이미지별 최대 그래디언트로 정규화: 가장 많이 움직이는 픽셀이 lr 만큼
-                x = (x - args.lr * g / g.abs().amax((1, 2, 3), keepdim=True).clamp_min(1e-12)).clamp(0, 255)
+                x = (x - args.lr * args.lr_decay**s * g / g.abs().amax((1, 2, 3), keepdim=True).clamp_min(1e-12)).clamp(0, 255)
             t_step += time.time() - t
     errs /= len(idx)
     print(" → ".join(f"{e:.6f}" for e in errs), f"| 반복 1회 {t_step / args.steps / len(idx):.3f}s/frame")
