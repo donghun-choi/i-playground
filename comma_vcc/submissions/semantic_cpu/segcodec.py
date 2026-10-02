@@ -74,6 +74,39 @@ def build_input_q(cur: np.ndarray, prev, prev2, s: int, kind: str) -> np.ndarray
     ], 1)
 
 
+class FastInput:
+    """build_input_q 와 같은 값을 torch float32 로 빠르게 만든다 (이전 프레임 비율은 프레임마다 한 번만 계산)."""
+
+    HS = [s // 2 for s in LEVELS]
+
+    def __init__(self):
+        self.known = {}
+        for s in LEVELS:
+            h = s // 2
+            for kind in "AB":
+                kn, tg = masks(h, kind)
+                self.known[h, kind] = (torch.from_numpy(kn).float(), torch.from_numpy(tg))
+
+    def fracs(self, m_t: torch.Tensor | None, n: int) -> dict:
+        """m_t: (n,H,W) uint8 → {h: (n,5,H/h,W/h) float32 = floor(count*64/h^2)} (없으면 0)"""
+        if m_t is None:
+            return {h: torch.zeros(n, K, SH // h, SW // h) for h in self.HS}
+        oh = F.one_hot(m_t.long(), K).permute(0, 3, 1, 2).float()
+        return {h: torch.floor((F.avg_pool2d(oh, h) if h > 1 else oh) * Q_IN) for h in self.HS}
+
+    def build(self, cur_t: torch.Tensor, s: int, kind: str, fp: dict, fp2: dict) -> torch.Tensor:
+        h = s // 2
+        n = cur_t.shape[0]
+        kn, _ = self.known[h, kind]
+        gh, gw = kn.shape
+        g = cur_t[:, ::h, ::h]
+        oh = F.one_hot(g.long(), K).permute(0, 3, 1, 2).float() * (kn * Q_IN)
+        lvl = torch.zeros(n, len(LEVELS), gh, gw)
+        lvl[:, LEVELS.index(s)] = Q_IN
+        return torch.cat([oh, (kn * Q_IN).expand(n, 1, gh, gw), fp[h], fp2[h],
+                          torch.full((n, 1, gh, gw), float(Q_IN if kind == "A" else 0)), lvl], 1)
+
+
 # ---------------------------------------------------------------- 정수 네트워크
 class QNet:
     """layers: [(W_q int (o,i,kh,kw), B_q int (o,), M int (o,), pad, relu)]"""
@@ -87,6 +120,8 @@ class QNet:
             in_max = 255
         self._t = [(torch.from_numpy(W.astype(np.float32)), torch.from_numpy(B).view(1, -1, 1, 1),
                     torch.from_numpy(M).view(1, -1, 1, 1), pad, relu) for W, B, M, pad, relu in layers]
+        # 재양자화를 float64 로: (acc + B) * M 은 2^53 보다 훨씬 작은 정수라 정확, 2^-16 곱도 정확 → floor 는 >> 와 같다
+        self._f = [(W, B.double(), M.double() * 2.0**-SHIFT, pad, relu) for W, B, M, pad, relu in self._t]
         self.dtype = torch.float32
 
     def self_check(self, x_q: np.ndarray) -> bool:
@@ -109,6 +144,17 @@ class QNet:
                 y = y.clamp(0, 255)
             x = y.to(self.dtype)
         return x.to(torch.int64).numpy()
+
+    def run(self, x: torch.Tensor) -> torch.Tensor:
+        """x: float32 정수값 텐서 → 정수값 logits (float32 텐서). __call__ 과 결과가 같다."""
+        x = x.to(self.dtype)
+        for W, B, Ms, pad, relu in self._f:
+            acc = F.conv2d(x, W.to(self.dtype), padding=pad)
+            y = torch.floor((acc.double() + B) * Ms)
+            if relu:
+                y = y.clamp(0, 255)
+            x = y.to(self.dtype)
+        return x
 
     # 직렬화: 층 수, 각 층 (o,i,k,pad,relu) + W(int8) + B(int32) + M(int32)
     def to_bytes(self) -> bytes:
@@ -172,9 +218,11 @@ def quantize_ctxnet(state_dict: dict, calib_inputs: list[np.ndarray], wbits: int
 
 def probs_from_logits(logit_q: np.ndarray) -> np.ndarray:
     """(n,5) 정수 logit → (n,5) float64 확률 (정수 빈도의 정확한 나눗셈)."""
+    logit_q = np.ascontiguousarray(logit_q)
     d = np.minimum(logit_q.max(1, keepdims=True) - logit_q, 255)
     f = EXP_TABLE[d].astype(np.float64)
-    return f / f.sum(1, keepdims=True)
+    # constriction 은 stride 를 무시하고 메모리를 그대로 읽는다 → 반드시 C 연속 배열로 넘긴다
+    return np.ascontiguousarray(f / f.sum(1, keepdims=True))
 
 
 # ---------------------------------------------------------------- coarse 격자 (적응형 카운트)
@@ -189,7 +237,7 @@ class CoarseModel:
 
     def probs(self, ctx):
         c = self.c[ctx].astype(np.float64)
-        return c / c.sum(1, keepdims=True)
+        return np.ascontiguousarray(c / c.sum(1, keepdims=True))
 
     def update(self, ctx, sym):
         np.add.at(self.c, (ctx, sym), 16)
@@ -202,7 +250,8 @@ def _family():
     return constriction.stream.model.Categorical(perfect=False)
 
 
-def encode(seg: np.ndarray, qnet: QNet) -> bytes:
+def encode(seg: np.ndarray, qnet: QNet, chunk: int = 16) -> bytes:
+    """프레임 chunk 개씩 묶어 확률을 한 번에 계산한 뒤, 디코드 순서(프레임 → 패스) 대로 부호화한다."""
     import constriction
 
     n = len(seg)
@@ -210,21 +259,42 @@ def encode(seg: np.ndarray, qnet: QNet) -> bytes:
     fam = _family()
     cm = CoarseModel()
     cy, cx = coarse_pos()
-    for t in range(n):
-        cur = seg[t : t + 1]
-        prev = seg[t - 1 : t] if t >= 1 else None
-        prev2 = seg[t - 2 : t - 1] if t >= 2 else None
-        sym = cur[0, cy, cx].astype(np.int32)
-        ctx = prev[0, cy, cx].astype(np.int64) if prev is not None else np.full(len(cy), K)
-        enc.encode(sym, fam, cm.probs(ctx))
-        cm.update(ctx, sym)
-        for s in LEVELS:
-            h = s // 2
-            for kind in "AB":
-                _, target = masks(h, kind)
-                logit = qnet(build_input_q(cur, prev, prev2, s, kind))[0]  # (5,gh,gw)
-                p = probs_from_logits(logit[:, target].T)
-                enc.encode(cur[0, ::h, ::h][target].astype(np.int32), fam, p)
+    fi = FastInput()
+    seg_t = torch.from_numpy(seg)
+    for t0 in range(0, n, chunk):
+        t1 = min(t0 + chunk, n)
+        b = t1 - t0
+        cur = seg_t[t0:t1]
+
+        def shifted(k):  # 각 프레임의 k 프레임 전 맵 비율 (없으면 0)
+            lo = t0 - k
+            missing = min(b, max(0, -lo))
+            parts = []
+            if missing:
+                parts.append(fi.fracs(None, missing))
+            if b - missing:
+                parts.append(fi.fracs(seg_t[lo + missing : t1 - k], b - missing))
+            return {h: torch.cat([q[h] for q in parts]) for h in fi.HS}
+
+        fp, fp2 = shifted(1), shifted(2)
+        per_pass = []
+        with torch.inference_mode():
+            for s in LEVELS:
+                h = s // 2
+                for kind in "AB":
+                    _, tg = fi.known[h, kind]
+                    logit = qnet.run(fi.build(cur, s, kind, fp, fp2))  # (b,5,gh,gw)
+                    lt = logit[:, :, tg].permute(0, 2, 1).to(torch.int64).numpy()  # (b,nt,5)
+                    sy = cur[:, ::h, ::h][:, tg].numpy().astype(np.int32)  # (b,nt)
+                    per_pass.append((lt, sy))
+        for j in range(b):
+            t = t0 + j
+            sym = seg[t, cy, cx].astype(np.int32)
+            ctx = seg[t - 1, cy, cx].astype(np.int64) if t >= 1 else np.full(len(cy), K)
+            enc.encode(sym, fam, cm.probs(ctx))
+            cm.update(ctx, sym)
+            for lt, sy in per_pass:
+                enc.encode(np.ascontiguousarray(sy[j]), fam, probs_from_logits(lt[j]))
     words = enc.get_compressed()
     return struct.pack("<I", n) + words.tobytes()
 
@@ -238,23 +308,26 @@ def decode(buf: bytes, qnet: QNet, progress=None) -> np.ndarray:
     fam = _family()
     cm = CoarseModel()
     cy, cx = coarse_pos()
+    fi = FastInput()
     seg = np.zeros((n, SH, SW), np.uint8)
-    for t in range(n):
-        cur = seg[t : t + 1]
-        prev = seg[t - 1 : t] if t >= 1 else None
-        prev2 = seg[t - 2 : t - 1] if t >= 2 else None
-        ctx = prev[0, cy, cx].astype(np.int64) if prev is not None else np.full(len(cy), K)
-        sym = dec.decode(fam, cm.probs(ctx))
-        cur[0, cy, cx] = sym
-        cm.update(ctx, sym.astype(np.int64))
-        for s in LEVELS:
-            h = s // 2
-            for kind in "AB":
-                _, target = masks(h, kind)
-                logit = qnet(build_input_q(cur, prev, prev2, s, kind))[0]
-                p = probs_from_logits(logit[:, target].T)
-                g = cur[0, ::h, ::h]  # view
-                g[target] = dec.decode(fam, p)
-        if progress:
-            progress(t)
+    seg_t = torch.from_numpy(seg)  # 메모리 공유
+    fp, fp2 = fi.fracs(None, 1), fi.fracs(None, 1)
+    with torch.inference_mode():
+        for t in range(n):
+            cur = seg_t[t : t + 1]
+            ctx = seg[t - 1, cy, cx].astype(np.int64) if t >= 1 else np.full(len(cy), K)
+            sym = dec.decode(fam, cm.probs(ctx))
+            seg[t, cy, cx] = sym
+            cm.update(ctx, sym.astype(np.int64))
+            for s in LEVELS:
+                h = s // 2
+                for kind in "AB":
+                    _, tg = fi.known[h, kind]
+                    logit = qnet.run(fi.build(cur, s, kind, fp, fp2))[0]  # (5,gh,gw)
+                    p = probs_from_logits(logit[:, tg].T.to(torch.int64).numpy())
+                    g = cur[0, ::h, ::h]  # view
+                    g[tg] = torch.from_numpy(dec.decode(fam, p).astype(np.uint8))
+            fp2, fp = fp, fi.fracs(cur, 1)
+            if progress:
+                progress(t)
     return seg

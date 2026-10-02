@@ -40,6 +40,8 @@ def main():
     ap.add_argument("--bs", type=int, default=16)
     ap.add_argument("--lr", type=float, default=0.05)
     ap.add_argument("--threads", type=int, default=1)
+    ap.add_argument("--rgb", action="store_true", help="기저를 RGB 3채널로 (기본: 회색 1채널)")
+    ap.add_argument("--binit", type=float, default=5.0)
     ap.add_argument("--dct", action="store_true", help="학습 기저 대신 고정 DCT 기저 (저장 비용 0)")
     ap.add_argument("--fp32-after", type=int, default=10**9, help="이 스텝부터 fp32 로 학습")
     ap.add_argument("--port", type=int, default=8003)
@@ -65,15 +67,15 @@ def main():
         c = torch.zeros(len(idx), args.k, requires_grad=True)
         opt = torch.optim.Adam([c], lr=args.lr)
     else:
-        B = (torch.randn(args.k, 1, bh, bw) * 5).requires_grad_(True)
-        c = torch.zeros(len(idx), args.k, requires_grad=True)
+        B = (torch.randn(args.k, 3 if args.rgb else 1, bh, bw) * args.binit).requires_grad_(True)
+        c = (torch.randn(len(idx), args.k) * 0.3).requires_grad_(True)
         opt = torch.optim.Adam([{"params": [B], "lr": args.lr * 20}, {"params": [c], "lr": args.lr}])
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.steps, eta_min=args.lr * 0.02)
     viz = LiveVis(f"comma vcc · carrier base={args.base} k={args.k} bres={args.bres}", port=args.port).start()
     t0 = time.time()
     for step in range(1, args.steps + 1):
         perm = torch.randperm(len(idx))[: args.bs]
-        delta = F.interpolate(torch.einsum("nk,kchw->nchw", c[perm], B), size=(SH, SW), mode="bilinear")
+        delta = F.interpolate(torch.einsum("nk,kchw->nchw", c[perm], B), size=(SH, SW), mode="bicubic")
         even = ste_round((base[perm] + delta).clamp(0, 255))
         with torch.autocast("cpu", dtype=torch.bfloat16, enabled=step < args.fp32_after):
             out = pose_out(net, even, odd[perm])
@@ -85,7 +87,7 @@ def main():
         viz.log(step, train_posenet_dist=loss.item())
         if step % 50 == 0 or step == args.steps:
             with torch.inference_mode():
-                delta = F.interpolate(torch.einsum("nk,kchw->nchw", c, B), size=(SH, SW), mode="bilinear")
+                delta = F.interpolate(torch.einsum("nk,kchw->nchw", c, B), size=(SH, SW), mode="bicubic")
                 even = (base + delta).clamp(0, 255).round()
                 d = ((pose_out(net, even, odd) - target) ** 2).mean().item()
             viz.log(step, posenet_dist_fp32=d, pose_term=float(np.sqrt(10 * d)))

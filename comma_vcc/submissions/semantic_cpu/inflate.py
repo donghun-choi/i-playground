@@ -21,7 +21,7 @@ sys.path.insert(0, str(HERE))
 
 import archive  # noqa: E402
 import segcodec  # noqa: E402
-from model import Renderer, even_frames, expand, unpack_state  # noqa: E402
+from model import Renderer, even_frames, expand_fine, unpack_state  # noqa: E402
 
 
 def log(msg):
@@ -29,7 +29,7 @@ def log(msg):
 
 
 def reconstruct(p: bytes, batch: int = 8):
-    """archive 바이트 → (even, odd) uint8 (600,384,512,3) 두 배열."""
+    """archive 바이트 → (even, odd) float32 (600,384,512,3) 두 배열 (평가 네트워크가 볼 값)."""
     sec = archive.unpack(p)
     qnet, _ = segcodec.QNet.from_bytes(archive.unxz(sec["ctxn"]))
     probe = np.random.default_rng(0).integers(0, segcodec.Q_IN + 1, (1, segcodec.C_IN, 48, 64))
@@ -42,23 +42,23 @@ def reconstruct(p: bytes, batch: int = 8):
     G = Renderer()
     G.load_state_dict(unpack_state(archive.unxz(sec["rend"]), G.state_dict()))
     G.eval()
-    B, c = archive.unpack_carrier(sec["carr"])
+    car = archive.unpack_carrier(sec["carr"])
     n = len(seg)
-    odd = np.zeros((n, 384, 512, 3), np.uint8)
-    even = np.zeros((n, 384, 512, 3), np.uint8)
+    odd = np.zeros((n, 384, 512, 3), np.float32)
+    even = np.zeros((n, 384, 512, 3), np.float32)
     t = time.time()
     with torch.inference_mode():
         for i in range(0, n, batch):
-            o = G(torch.from_numpy(seg[i : i + batch])).round().clamp(0, 255)
-            e = even_frames(o, c[i : i + batch], B).round()
-            odd[i : i + batch] = o.permute(0, 2, 3, 1).to(torch.uint8).numpy()
-            even[i : i + batch] = e.permute(0, 2, 3, 1).to(torch.uint8).numpy()
+            o = G(torch.from_numpy(seg[i : i + batch]))
+            e = even_frames(o, car["c"][i : i + batch], car["B"], car["base"], car["mode"])
+            odd[i : i + batch] = o.permute(0, 2, 3, 1).numpy()
+            even[i : i + batch] = e.permute(0, 2, 3, 1).numpy()
     log(f"렌더링 {time.time() - t:.0f}s")
     return even, odd
 
 
 def main(archive_dir: str, out_dir: str, list_file: str):
-    torch.set_num_threads(os.cpu_count() or 4)
+    torch.set_num_threads(int(os.environ.get("INFLATE_THREADS", os.cpu_count() or 4)))
     names = [line.strip() for line in Path(list_file).read_text().splitlines() if line.strip()]
     assert len(names) == 1, "이 archive 는 영상 하나용"
     p = (Path(archive_dir) / "p").read_bytes()
@@ -69,7 +69,7 @@ def main(archive_dir: str, out_dir: str, list_file: str):
     with open(out, "wb") as f:
         for i in range(0, len(odd), 20):
             pair = np.stack([even[i : i + 20], odd[i : i + 20]], 1).reshape(-1, 384, 512, 3)
-            f.write(expand(pair).tobytes())
+            f.write(expand_fine(pair).tobytes())
     log(f"{out} 기록 {time.time() - t:.0f}s")
 
 

@@ -37,8 +37,10 @@ def main():
     ap.add_argument("--carrier", default=str(CACHE / "carrier.bin"))
     ap.add_argument("--segs", default=None, help="이미 인코드한 seg 스트림 재사용 (ctx 모델이 같을 때만)")
     ap.add_argument("--out", default=str(SUB / "archive.zip"))
+    ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--no-verify", action="store_true", help="seg 디코드 왕복 확인 생략")
     args = ap.parse_args()
-    torch.set_num_threads(4)
+    torch.set_num_threads(args.threads)
     _, seg, _ = load_gt()
 
     t = time.time()
@@ -60,6 +62,8 @@ def main():
         print(f"  {name}: {len(b):>8,} B  (rate 항 {score(0, 0, len(b))['rate_term']:.4f})")
     print(f"archive.zip {size:,} B → rate 항 {score(0, 0, size)['rate_term']:.4f}")
 
+    if args.no_verify:
+        return
     # 디코드 검증 (inflate 와 같은 함수)
     t = time.time()
     q2, _ = sc.QNet.from_bytes(archive.unxz(ctxn))

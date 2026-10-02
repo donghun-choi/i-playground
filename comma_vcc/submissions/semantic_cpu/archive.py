@@ -40,39 +40,45 @@ def unxz(data: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------- carrier
-# kind 0: 학습 기저 B (k,1,bh,bw) int8 + 기저별 스케일,  kind 1: 고정 DCT 기저 (저장 안 함)
-# 계수 c (n,k): 차원별 양자화 간격 step[k] 의 정수배. 시간 방향 차분 후 int16 로 저장.
-def pack_carrier(kind: int, B_q: np.ndarray | None, B_scale: np.ndarray | None, c_int: np.ndarray, step: np.ndarray, bh: int, bw: int) -> bytes:
+# 헤더: kind(0 학습 기저 / 1 DCT), base(0 odd / 1 gray), mode(0 bilinear / 1 bicubic), n, k, C, bh, bw
+# 학습 기저 B (k,C,bh,bw): int8 + 기저별 스케일.  계수 c (n,k): 차원별 간격 step[k] 의 정수배, 시간 차분 후 int16.
+BASES = ("odd", "gray")
+MODES = ("bilinear", "bicubic")
+
+
+def pack_carrier(kind, base, mode, B_q, B_scale, c_int, step, C, bh, bw) -> bytes:
     n, k = c_int.shape
-    head = struct.pack("<BHHHH", kind, n, k, bh, bw)
+    head = struct.pack("<BBBHHBHH", kind, BASES.index(base), MODES.index(mode), n, k, C, bh, bw)
     body = [step.astype(np.float32).tobytes()]
     if kind == 0:
         body += [B_scale.astype(np.float32).tobytes(), B_q.astype(np.int8).tobytes()]
     d = np.diff(c_int, axis=0, prepend=np.zeros((1, k), c_int.dtype)).astype(np.int16)
-    # 차원 우선 (같은 차원 계수끼리 붙어 있어야 lzma 가 잘 줄인다)
-    body.append(np.ascontiguousarray(d.T).tobytes())
+    body.append(np.ascontiguousarray(d.T).tobytes())  # 차원 우선 (lzma 가 잘 줄이도록)
     return head + xz(b"".join(body))
 
 
+_HEAD = struct.calcsize("<BBBHHBHH")
+
+
 def unpack_carrier(buf: bytes):
-    kind, n, k, bh, bw = struct.unpack_from("<BHHHH", buf, 0)
-    body = unxz(buf[9:])
+    """→ dict(B, c, base, mode)"""
+    kind, base, mode, n, k, C, bh, bw = struct.unpack_from("<BBBHHBHH", buf, 0)
+    body = unxz(buf[_HEAD:])
     off = 0
     step = np.frombuffer(body, np.float32, k, off)
     off += 4 * k
-    B = None
     if kind == 0:
         scale = np.frombuffer(body, np.float32, k, off)
         off += 4 * k
-        B_q = np.frombuffer(body, np.int8, k * bh * bw, off).reshape(k, 1, bh, bw)
-        off += k * bh * bw
+        B_q = np.frombuffer(body, np.int8, k * C * bh * bw, off).reshape(k, C, bh, bw)
+        off += k * C * bh * bw
         B = torch.from_numpy(B_q.astype(np.float32) * scale.reshape(k, 1, 1, 1))
+    else:
+        B = dct_basis(k, bh, bw)
     d = np.frombuffer(body, np.int16, n * k, off).reshape(k, n).T
     c_int = np.cumsum(d.astype(np.int64), axis=0)
     c = torch.from_numpy((c_int * step.astype(np.float64)).astype(np.float32))
-    if kind == 1:
-        B = dct_basis(k, bh, bw)
-    return B, c
+    return {"B": B, "c": c, "base": BASES[base], "mode": MODES[mode]}
 
 
 def dct_basis(k: int, bh: int, bw: int) -> torch.Tensor:
