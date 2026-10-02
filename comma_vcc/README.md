@@ -35,10 +35,10 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v3, 점수 0.3403)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v4, 점수 0.3298)
 
 ```
-archive (204KB) = 정수 문맥 CNN (17KB) + seg 맵 601장 무손실 스트림 (124KB) + 렌더러 (30KB) + pose (32KB)
+archive (224KB) = 정수 문맥 CNN (17KB) + seg 맵 601장 무손실 스트림 (124KB) + 렌더러 (50KB, 폭 24·32·40) + pose (32KB)
 
 seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본 짝수 프레임 0 의 맵 1장)
 홀수 프레임 i   = 렌더러(M_i)                                         → SegNet 이 M_i 를 내도록 학습
@@ -60,7 +60,7 @@ seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본
 | `lab/build_archive.py` | 정수화 + 인코드 + archive.zip 조립 |
 | 나머지 `lab/*_exp.py`, `analyze.py`, `seg_errors.py`, `bits_breakdown.py` | 실험/분석 |
 
-### v3 재현 (CPU 4코어, 대략 10시간)
+### v4 재현 (CPU 4코어, 대략 14시간)
 ```bash
 cd comma_vcc/lab
 ../.venv/bin/python build_cache.py                                                   # 3분
@@ -72,12 +72,16 @@ cd comma_vcc/lab
 ../.venv/bin/python pose_fit.py --renderer ../cache/renderer_v1.pt --rbits 6 --out ../cache/pose2_v1r.bin
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v1r.bin --renderer ../cache/renderer_v1ft.pt --cbits 10 --out ../cache/pose2_v1ft.bin
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v1ft.bin --renderer ../cache/renderer_v1ft.pt --cbits 10 --epochs 40 --lr 0.002 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_v1ft2.bin
-../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24d2.pt --cbits 6 --renderer ../cache/renderer_v1ft.pt --rbits 6 --pose2 ../cache/pose2_v1ft2.bin
+# (여기까지가 v3) v4: 렌더러를 넓혀서 이어 학습하고 pose 를 다시 맞춘다
+../.venv/bin/python renderer.py --widths 24,32,40 --widen-from ../cache/renderer_v1ft.pt --epochs 10 --lr 1e-3 --cosine --bits 6 --out ../cache/renderer_w243240.pt
+../.venv/bin/python renderer.py --widths 24,32,40 --resume ../cache/renderer_w243240.pt --epochs 6 --lr 4e-4 --cosine --fp32 --bits 6 --out ../cache/renderer_w243240ft.pt
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v1ft2.bin --renderer ../cache/renderer_w243240ft.pt --renderer-cfg 24,32,40 --cbits 10 --epochs 100 --lr 0.02 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_w24.bin
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24d2.pt --cbits 6 --renderer ../cache/renderer_w243240ft.pt --renderer-cfg 24,32,40 --rbits 6 --pose2 ../cache/pose2_w24.bin
 cd .. && bash run.sh semantic_cpu
 ```
 
 ### 시간 제한에 대해
-우리 머신 (4코어 AVX-512, fp32 행렬곱 632 GFLOPS) 에서 inflate 334s + 평가 231s = 9.5분.
+우리 머신 (4코어 AVX-512, fp32 행렬곱 632 GFLOPS) 에서 v4 는 inflate 378s + 평가 242s = 10.4분.
 공식 러너는 GitHub `ubuntu-latest` (4 vCPU) 이고 30분에는 환경 준비(apt, uv sync, LFS)도 포함된다.
 러너가 2~3배 느리면 빠듯할 수 있다 — 실제 제출 전에는 러너에서 시간을 확인해야 한다.
 
@@ -147,3 +151,4 @@ cd .. && bash run.sh semantic_cpu
 | semantic_cpu v1 | 0.00153 | 0.00067 | 0.00650 | **0.397** | seg맵 142KB + 문맥모델 23KB + 렌더러 42KB + carrier 36KB, inflate 740s + 평가 251s (4코어) |
 | semantic_cpu v2 | 0.00153 | 0.00030 | 0.00561 | **0.3485** | seg맵 129KB(dilation 6비트 문맥모델 17KB) + 렌더러 6비트 30KB + pose(이전 렌더+아핀+carrier) 35KB, inflate 337s + 평가 224s |
 | semantic_cpu v3 | 0.00144 | 0.00037 | 0.00543 | **0.3403** | 렌더러 fp32 미세조정, 문맥모델 추가 학습(193 B/frame), pose 재다듬기(계수 10비트). inflate 334s + 평가 231s |
+| semantic_cpu v4 | 0.00121 | 0.00036 | 0.00595 | **0.3298** | 렌더러 폭 16·24·32 → 24·32·40 (함수 보존 확장 + bf16 10에폭 + fp32 6에폭, 6비트 49.8KB), pose 재다듬기. inflate 378s + 평가 242s |

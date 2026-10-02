@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--bs", type=int, default=24)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--port", type=int, default=8014)
+    ap.add_argument("--train-b", type=float, default=0.0, help="> 0 이면 기저 B 도 이 학습률로 함께 학습 (렌더러가 바뀌어 회전 차원이 나빠졌을 때)")
+    ap.add_argument("--bbits", type=int, default=6)
     args = ap.parse_args()
     from livevis import LiveVis
 
@@ -50,7 +52,11 @@ def main():
     odd, prev = renders(args.renderer, cfg, seg, pre, args.rbits)
     blob = open(args.pose2, "rb").read()
     pos = archive.unpack_pose2(blob)
-    B = pos["B"]
+    B = pos["B"].clone()
+    opt_B = None
+    if args.train_b > 0:
+        B.requires_grad_(True)
+        opt_B = torch.optim.Adam([B], lr=args.train_b)
     batches = [torch.arange(i, min(i + args.bs, n)) for i in range(0, n, args.bs)]
     A = [pos["a"][b].clone().requires_grad_(True) for b in batches]
     C = [pos["c"][b].clone().requires_grad_(True) for b in batches]
@@ -58,7 +64,7 @@ def main():
 
     def evaluate(a, c):
         with torch.inference_mode():
-            return torch.cat([pose_out(net, even_frames_prev(prev[b], a[j], c[j], B), odd[b]) for j, b in enumerate(batches)]) - target
+            return torch.cat([pose_out(net, even_frames_prev(prev[b], a[j], c[j], B.detach()), odd[b]) for j, b in enumerate(batches)]) - target
 
     def run(epochs, lr, q=None):
         opts = [torch.optim.Adam([A[j], C[j]], lr=lr) for j in range(len(batches))]
@@ -67,12 +73,19 @@ def main():
             for j, b in enumerate(batches):
                 for g in opts[j].param_groups:
                     g["lr"] = cur_lr
+                train_b = opt_B is not None and q is None
                 a, c = (A[j], C[j]) if q is None else q(A[j], C[j])
-                out = pose_out(net, even_frames_prev(prev[b], a, c, B), odd[b])
+                out = pose_out(net, even_frames_prev(prev[b], a, c, B if train_b else B.detach()), odd[b])
                 loss = ((out - target[b]) ** 2).sum()
                 opts[j].zero_grad()
+                if train_b:
+                    opt_B.zero_grad()
+                    for g in opt_B.param_groups:
+                        g["lr"] = args.train_b * cur_lr / lr
                 loss.backward()
                 opts[j].step()
+                if train_b:
+                    opt_B.step()
             if ep % 5 == 4 or ep == epochs - 1:
                 aa = [x.detach() for x in A]
                 cc = [x.detach() for x in C]
@@ -84,6 +97,14 @@ def main():
                 print(f"epoch {ep + 1}: posenet_dist {d:.7f} term {np.sqrt(10 * d):.4f} 차원별 RMS {err.pow(2).mean(0).sqrt().numpy().round(4)} ({time.time() - t0:.0f}s)", flush=True)
 
     run(args.epochs, args.lr)
+    B_new = None
+    if opt_B is not None:  # 기저를 저장 비트로 고정
+        with torch.no_grad():
+            bq = 2 ** (args.bbits - 1) - 1
+            B_scale_new = B.abs().amax((1, 2, 3)) / bq
+            B_q_new = (B / B_scale_new.view(-1, 1, 1, 1)).round().clamp(-bq, bq)
+            B = (B_q_new * B_scale_new.view(-1, 1, 1, 1)).detach()
+            B_new = (B_q_new.numpy().astype(np.int8), B_scale_new.numpy().astype(np.float32))
 
     # 격자 양자화
     with torch.no_grad():
@@ -125,6 +146,8 @@ def main():
     body = archive.unxz(blob[struct.calcsize("<HHBHH"):])
     B_scale = np.frombuffer(body, np.float32, k, 4 * (k + 6))
     B_q = np.frombuffer(body, np.int8, k * Cc * bh * bw, 4 * (2 * k + 6)).reshape(k, Cc, bh, bw)
+    if B_new is not None:
+        B_q, B_scale = B_new
     out = archive.pack_pose2(B_q, B_scale, c_int.numpy().astype(np.int64), c_step.numpy(), a_int.numpy().astype(np.int64), a_step.numpy())
     open(args.out, "wb").write(out)
     pos2 = archive.unpack_pose2(out)
