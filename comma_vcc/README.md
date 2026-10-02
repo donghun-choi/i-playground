@@ -15,7 +15,7 @@ score = 100 * segnet_dist + sqrt(10 * posenet_dist) + 25 * rate
 | `posenet_dist` | 연속 두 프레임(YUV6, 512x384)을 PoseNet에 넣은 6차원 pose 출력의 MSE |
 | `rate` | `archive.zip` 크기 / 원본 크기 |
 
-- 평가 제한: inflate + 평가 합쳐 30분 (CPU 4코어/16GB 또는 T4 GPU).
+- 평가 제한: GitHub Actions 작업 전체 30분 (환경 준비 + inflate + 평가, CPU 4 vCPU/16GB 또는 T4 GPU).
 - 압축 쪽에는 원본 영상, 두 모델 등 무엇이든 써도 된다. inflate에 신경망 가중치가 필요하면 그건 archive 크기에 포함된다.
 - 리더보드: 베이스라인 4.39 → 상위권 ~0.15 (2026-10 기준).
 
@@ -35,13 +35,51 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다.
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v3, 점수 0.3403)
 
 ```
-archive = [seg 맵 600장 (무손실)] + [렌더러] + [pose carrier]
-홀수 프레임 = 렌더러(seg 맵)                     → SegNet 이 같은 맵을 내도록 학습
-짝수 프레임 = 127.5 + bicubic(Σ c[i,k] · B_k)    → PoseNet 이 같은 pose 를 내도록 학습 (기저 B 공유, 계수 c 쌍마다)
+archive (204KB) = 정수 문맥 CNN (17KB) + seg 맵 601장 무손실 스트림 (124KB) + 렌더러 (30KB) + pose (32KB)
+
+seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본 짝수 프레임 0 의 맵 1장)
+홀수 프레임 i   = 렌더러(M_i)                                         → SegNet 이 M_i 를 내도록 학습
+짝수 프레임 i   = 아핀_i(홀수 프레임 i-1) + bicubic(Σ_k c[i,k] · B_k)    → PoseNet 이 원본 pose 를 내도록 피팅
+                  (아핀 6개 + 계수 12개는 쌍마다, 기저 B 12x3x24x32 는 공유)
+1164x874 기록    = 512x384 float 이미지를 2x2 서브픽셀 정수로 펼침 (평가의 bilinear 축소가 그대로 되돌림)
 ```
+
+### 파일
+| 경로 | 내용 |
+| --- | --- |
+| `submissions/semantic_cpu/segcodec.py` | 계층 순서 + 정수 문맥 CNN + range coder (인코드/디코드) |
+| `submissions/semantic_cpu/model.py` | 렌더러, 아핀/carrier, 가중치 저장 형식, 서브픽셀 확장 |
+| `submissions/semantic_cpu/archive.py`, `inflate.py`, `inflate.sh` | archive 포맷과 복원 |
+| `lab/build_cache.py` | 원본을 한 번 디코드해서 네트워크 입출력 캐시 |
+| `lab/ctxmodel.py` | 문맥 CNN 학습 (float) |
+| `lab/renderer.py` | 렌더러 학습 |
+| `lab/pose_fit.py`, `lab/pose_refine.py` | pose 피팅 (기저+계수), 쌍별 다듬기 |
+| `lab/build_archive.py` | 정수화 + 인코드 + archive.zip 조립 |
+| 나머지 `lab/*_exp.py`, `analyze.py`, `seg_errors.py`, `bits_breakdown.py` | 실험/분석 |
+
+### v3 재현 (CPU 4코어, 대략 10시간)
+```bash
+cd comma_vcc/lab
+../.venv/bin/python build_cache.py                                                   # 3분
+../.venv/bin/python ctxmodel.py --ch 24 --layers 5 --dils 1,2,4,2,1 --steps 20000 --out ../cache/ctxnet_c24d.pt
+../.venv/bin/python ctxmodel.py --ch 24 --layers 5 --dils 1,2,4,2,1 --steps 16000 --lr 1e-3 --init ../cache/ctxnet_c24d.pt --out ../cache/ctxnet_c24d2.pt
+../.venv/bin/python renderer.py --epochs 5  --out ../cache/renderer.pt --round          # v1 은 처음에 정수 반올림으로 학습했다
+../.venv/bin/python renderer.py --epochs 10 --lr 1.5e-3 --resume ../cache/renderer.pt --out ../cache/renderer_v1.pt --round
+../.venv/bin/python renderer.py --epochs 8 --lr 4e-4 --cosine --fp32 --bits 6 --resume ../cache/renderer_v1.pt --out ../cache/renderer_v1ft.pt
+../.venv/bin/python pose_fit.py --renderer ../cache/renderer_v1.pt --rbits 6 --out ../cache/pose2_v1r.bin
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v1r.bin --renderer ../cache/renderer_v1ft.pt --cbits 10 --out ../cache/pose2_v1ft.bin
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v1ft.bin --renderer ../cache/renderer_v1ft.pt --cbits 10 --epochs 40 --lr 0.002 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_v1ft2.bin
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24d2.pt --cbits 6 --renderer ../cache/renderer_v1ft.pt --rbits 6 --pose2 ../cache/pose2_v1ft2.bin
+cd .. && bash run.sh semantic_cpu
+```
+
+### 시간 제한에 대해
+우리 머신 (4코어 AVX-512, fp32 행렬곱 632 GFLOPS) 에서 inflate 334s + 평가 231s = 9.5분.
+공식 러너는 GitHub `ubuntu-latest` (4 vCPU) 이고 30분에는 환경 준비(apt, uv sync, LFS)도 포함된다.
+러너가 2~3배 느리면 빠듯할 수 있다 — 실제 제출 전에는 러너에서 시간을 확인해야 한다.
 
 ### 분석에서 나온 사실 (lab/analyze.py 등)
 - 평가 네트워크는 1164x874 를 512x384 로 bilinear 축소해서 본다. 축소가 읽는 원본 픽셀은 768행 x 1024열뿐이고 겹치지 않는다.
