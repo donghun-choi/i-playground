@@ -86,8 +86,50 @@ class RendererV2(nn.Module):
 
 
 def make_renderer(cfg) -> nn.Module:
-    """cfg: None/() → v1 Renderer, (width, fdim, n_frames, dils) → RendererV2"""
-    return RendererV2(*cfg) if cfg else Renderer()
+    """cfg: None/() → v1 Renderer (16,24,32), (c1, c2, c3) → 폭을 바꾼 v1, (width, fdim, n_frames, dils) → RendererV2"""
+    if not cfg:
+        return Renderer()
+    return Renderer(*cfg) if len(cfg) == 3 else RendererV2(*cfg)
+
+
+def parse_rcfg(s: str | None, n_frames: int = 600):
+    """'24,32,40' → v1 폭 (24,32,40), '48,8' → RendererV2 (48,8,n,(1,1,2,4)), None → 기본 v1."""
+    if not s:
+        return None
+    v = tuple(int(x) for x in s.split(","))
+    return v if len(v) == 3 else (v[0], v[1], n_frames, (1, 1, 2, 4))
+
+
+def widen_renderer(old: Renderer, c1: int, c2: int, c3: int) -> Renderer:
+    """v1 Renderer 를 더 넓게 만들되 처음엔 같은 함수가 되도록 (새 채널의 나가는 가중치 = 0).
+
+    새 채널은 기본 초기화된 들어오는 가중치를 가지므로 학습이 시작되면 바로 쓰이기 시작한다.
+    """
+    o1, o2, o3 = old.cfg
+    new = Renderer(c1, c2, c3)
+    r = lambda a, b: list(range(a, b))  # noqa: E731
+    # 층별 (이름, 이전 입력 인덱스 → 새 입력 인덱스, 이전 출력 수)
+    in_maps = {
+        "e1.0": (r(0, 7), r(0, 7)),
+        "e1.2": (r(0, o1), r(0, o1)),
+        "e2.0": (r(0, o1), r(0, o1)),
+        "e2.2": (r(0, o2), r(0, o2)),
+        "e3.0": (r(0, o2), r(0, o2)),
+        "e3.2": (r(0, o3), r(0, o3)),
+        "d2.0": (r(0, o3 + o2), r(0, o3) + r(c3, c3 + o2)),
+        "d1.0": (r(0, o2 + o1), r(0, o2) + r(c2, c2 + o1)),
+        "out": (r(0, o1), r(0, o1)),
+    }
+    olds, news = dict(old.named_modules()), dict(new.named_modules())
+    with torch.no_grad():
+        for name, (src_in, dst_in) in in_maps.items():
+            a, b = olds[name], news[name]
+            n_out = a.weight.shape[0]
+            new_cols = sorted(set(range(b.weight.shape[1])) - set(dst_in))
+            b.weight[:n_out, new_cols] = 0  # 기존 출력은 새 입력을 보지 않는다
+            b.weight[:n_out][:, dst_in] = a.weight[:, src_in]
+            b.bias[:n_out] = a.bias
+    return new
 
 
 def render(G: nn.Module, seg: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:

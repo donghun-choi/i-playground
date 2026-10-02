@@ -19,6 +19,7 @@ import torch
 
 from common import CACHE, SUB, load_gt, score
 import archive  # noqa: E402
+from model import parse_rcfg  # noqa: E402
 import segcodec as sc  # noqa: E402
 from model import pack_state  # noqa: E402
 
@@ -41,7 +42,7 @@ def main():
     ap.add_argument("--segs", default=None, help="이미 인코드한 seg 스트림 재사용 (ctx 모델이 같을 때만)")
     ap.add_argument("--out", default=str(SUB / "archive.zip"))
     ap.add_argument("--threads", type=int, default=4)
-    ap.add_argument("--renderer-cfg", default=None, help="RendererV2 이면 'width,fdim'")
+    ap.add_argument("--renderer-cfg", default=None, help="렌더러 구성: v1 폭 'c1,c2,c3' 또는 RendererV2 'width,fdim'")
     ap.add_argument("--rbits", type=int, default=8, help="렌더러 저장 비트 수 (pose_fit 과 같게)")
     ap.add_argument("--cbits", type=int, default=8, help="문맥 모델 가중치 비트 수")
     ap.add_argument("--segs-only", action="store_true", help="seg 스트림만 인코드해서 캐시에 저장")
@@ -64,10 +65,7 @@ def main():
         print(f"seg 스트림 {len(segs):,} B ({len(segs) / len(seg):.1f} B/frame), 문맥모델 {len(ctxn):,} B", flush=True)
         return
     print(f"seg 스트림 {len(segs):,} B ({len(segs) / len(seg):.0f} B/frame), 문맥모델 {len(ctxn):,} B ({time.time() - t:.0f}s)", flush=True)
-    cfg = None
-    if args.renderer_cfg:
-        w, fd = (int(v) for v in args.renderer_cfg.split(","))
-        cfg = (w, fd, len(seg), (1, 1, 2, 4))
+    cfg = parse_rcfg(args.renderer_cfg, len(seg))
     rend = archive.pack_renderer(cfg, pack_state(torch.load(args.renderer), args.rbits))
     if args.pose2:
         pose_sec = ("pos2", open(args.pose2, "rb").read())

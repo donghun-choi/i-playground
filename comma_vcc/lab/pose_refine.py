@@ -16,6 +16,7 @@ import torch
 
 from common import CACHE, SH, SW, downsample, load_gt, nets, pose_out
 import archive  # noqa: E402
+from model import parse_rcfg  # noqa: E402
 from model import even_frames_prev, expand_fine  # noqa: E402
 from pose_fit import renders
 
@@ -44,10 +45,7 @@ def main():
     n = len(seg)
     target = torch.from_numpy(pose)
     pre = np.load(CACHE / "seg_pre.npy")
-    cfg = None
-    if args.renderer_cfg:
-        w, fd = (int(v) for v in args.renderer_cfg.split(","))
-        cfg = (w, fd, n, (1, 1, 2, 4))
+    cfg = parse_rcfg(args.renderer_cfg, n)
     t0 = time.time()
     odd, prev = renders(args.renderer, cfg, seg, pre, args.rbits)
     blob = open(args.pose2, "rb").read()

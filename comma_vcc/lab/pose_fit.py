@@ -17,6 +17,7 @@ import torch
 
 from common import CACHE, SH, SW, downsample, load_gt, nets, pose_out
 import archive  # noqa: E402
+from model import parse_rcfg  # noqa: E402
 from model import even_frames_prev, expand_fine, make_renderer, quantize_roundtrip, render  # noqa: E402
 
 
@@ -38,7 +39,7 @@ def renders(renderer_path, cfg, seg, pre, bits=8, bs=8):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--renderer", default=str(CACHE / "renderer_v1.pt"))
-    ap.add_argument("--renderer-cfg", default=None, help="RendererV2 이면 'width,fdim'")
+    ap.add_argument("--renderer-cfg", default=None, help="렌더러 구성: v1 폭 'c1,c2,c3' 또는 RendererV2 'width,fdim'")
     ap.add_argument("--out", default=str(CACHE / "pose2.bin"))
     ap.add_argument("--rbits", type=int, default=8, help="렌더러 저장 비트 수 (build_archive 와 같게)")
     ap.add_argument("--k", type=int, default=12)
@@ -65,10 +66,7 @@ def main():
     with torch.inference_mode():
         pre = net.segnet(torch.from_numpy(np.array(small[0:1]))).argmax(1).numpy().astype(np.uint8)
     np.save(CACHE / "seg_pre.npy", pre)
-    cfg = None
-    if args.renderer_cfg:
-        w, fd = (int(v) for v in args.renderer_cfg.split(","))
-        cfg = (w, fd, n, (1, 1, 2, 4))
+    cfg = parse_rcfg(args.renderer_cfg, n)
     odd, prev = renders(args.renderer, cfg, seg, pre, args.rbits)
     print(f"렌더 {time.time() - t0:.0f}s", flush=True)
     viz = LiveVis(f"comma vcc · pose v2 피팅 (이전 렌더 + 아핀 + carrier k={args.k})", port=args.port).start()

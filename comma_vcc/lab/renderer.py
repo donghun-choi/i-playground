@@ -19,7 +19,7 @@ from PIL import Image
 from common import CACHE, SH, SW, load_gt, nets
 import copy
 
-from model import Renderer, fake_quant_, make_renderer, quantize_roundtrip, render  # noqa: E402  (제출물 패키지와 같은 정의)
+from model import Renderer, fake_quant_, make_renderer, quantize_roundtrip, render, widen_renderer  # noqa: E402  (제출물 패키지와 같은 정의)
 
 PALETTE = np.array([[64, 64, 64], [230, 230, 230], [42, 120, 214], [12, 163, 12], [208, 59, 59]], np.uint8)
 
@@ -64,6 +64,8 @@ def main():
     ap.add_argument("--arch", default="v1", help="v1 | v2 (전해상도 + 프레임별 FiLM)")
     ap.add_argument("--width", type=int, default=48)
     ap.add_argument("--fdim", type=int, default=8)
+    ap.add_argument("--widths", default=None, help="v1 폭 c1,c2,c3 (예: 24,32,40)")
+    ap.add_argument("--widen-from", default=None, help="이 v1 체크포인트를 --widths 로 넓혀서 시작 (처음엔 같은 출력)")
     ap.add_argument("--bits", type=int, default=8, help="저장 비트 수 (평가에 반영)")
     ap.add_argument("--project", action="store_true", help="스텝마다 가중치를 --bits 격자로 투영 (양자화 인지 미세조정)")
     ap.add_argument("--full-eval", action="store_true", help="끝나고 600장 전체 평가")
@@ -75,7 +77,12 @@ def main():
     torch.manual_seed(0)
     net = nets()
     _, seg, _ = load_gt()
-    G = make_renderer((args.width, args.fdim, len(seg), (1, 1, 2, 4)) if args.arch == "v2" else None)
+    widths = tuple(int(v) for v in args.widths.split(",")) if args.widths else None
+    G = make_renderer((args.width, args.fdim, len(seg), (1, 1, 2, 4)) if args.arch == "v2" else widths)
+    if args.widen_from:
+        old = Renderer()
+        old.load_state_dict(torch.load(args.widen_from))
+        G = widen_renderer(old, *widths)
     net.segnet.to(memory_format=torch.channels_last)
     if args.resume:
         G.load_state_dict(torch.load(args.resume))
