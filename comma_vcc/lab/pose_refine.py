@@ -38,6 +38,8 @@ def main():
     ap.add_argument("--port", type=int, default=8014)
     ap.add_argument("--train-b", type=float, default=0.0, help="> 0 이면 기저 B 도 이 학습률로 함께 학습 (렌더러가 바뀌어 회전 차원이 나빠졌을 때)")
     ap.add_argument("--bbits", type=int, default=6)
+    ap.add_argument("--plain-epochs", type=int, default=0, help="본 학습(가중/B 학습) 뒤 B 고정 + 일반 MSE 로 더 학습할 에폭")
+    ap.add_argument("--dimw", type=float, default=0.0, help="본 학습 손실의 차원별 가중 (1/분산)^dimw (양자화 단계는 일반 MSE)")
     args = ap.parse_args()
     from livevis import LiveVis
 
@@ -46,6 +48,8 @@ def main():
     small, seg, pose = load_gt()
     n = len(seg)
     target = torch.from_numpy(pose)
+    wdim = target.var(0) ** (-args.dimw)
+    wdim = wdim / wdim.mean()
     pre = np.load(CACHE / "seg_pre.npy")
     cfg = parse_rcfg(args.renderer_cfg, n)
     t0 = time.time()
@@ -66,17 +70,18 @@ def main():
         with torch.inference_mode():
             return torch.cat([pose_out(net, even_frames_prev(prev[b], a[j], c[j], B.detach()), odd[b]) for j, b in enumerate(batches)]) - target
 
-    def run(epochs, lr, q=None):
+    def run(epochs, lr, q=None, weighted=True, with_b=True):
         opts = [torch.optim.Adam([A[j], C[j]], lr=lr) for j in range(len(batches))]
         for ep in range(epochs):
             cur_lr = lr * (0.02 + 0.98 * 0.5 * (1 + np.cos(np.pi * ep / max(epochs, 1))))
             for j, b in enumerate(batches):
                 for g in opts[j].param_groups:
                     g["lr"] = cur_lr
-                train_b = opt_B is not None and q is None
+                train_b = opt_B is not None and q is None and with_b
                 a, c = (A[j], C[j]) if q is None else q(A[j], C[j])
                 out = pose_out(net, even_frames_prev(prev[b], a, c, B if train_b else B.detach()), odd[b])
-                loss = ((out - target[b]) ** 2).sum()
+                sq = (out - target[b]) ** 2
+                loss = (sq * wdim).sum() if (q is None and weighted) else sq.sum()
                 opts[j].zero_grad()
                 if train_b:
                     opt_B.zero_grad()
@@ -105,6 +110,8 @@ def main():
             B_q_new = (B / B_scale_new.view(-1, 1, 1, 1)).round().clamp(-bq, bq)
             B = (B_q_new * B_scale_new.view(-1, 1, 1, 1)).detach()
             B_new = (B_q_new.numpy().astype(np.int8), B_scale_new.numpy().astype(np.float32))
+    if args.plain_epochs:
+        run(args.plain_epochs, args.lr, weighted=False, with_b=False)
 
     # 격자 양자화
     with torch.no_grad():
