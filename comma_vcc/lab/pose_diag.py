@@ -34,6 +34,7 @@ def main():
     ap.add_argument("--pose2", default=str(CACHE / "pose2_w24b.bin"))
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--port", type=int, default=8016)
+    ap.add_argument("--b-lr", type=float, default=0.02, help="prev 모드 기저 학습률 (0 이면 고정)")
     args = ap.parse_args()
     from livevis import LiveVis
 
@@ -64,10 +65,10 @@ def main():
             return (127.5 + 32 * torch.einsum("nk,kchw->nchw", c, b) / math.sqrt(args.k)).clamp(0, 255)
     elif args.mode == "prev":
         pos = archive.unpack_pose2(open(args.pose2, "rb").read())
-        B = pos["B"].clone().requires_grad_(True)
+        B = pos["B"].clone().requires_grad_(args.b_lr > 0)
         a = pos["a"][sel].clone().requires_grad_(True)
         c = pos["c"][sel].clone().requires_grad_(True)
-        groups = [{"params": [B], "lr": 0.02}, {"params": [a, c], "lr": 0.02}]
+        groups = [{"params": [a, c], "lr": 0.02}] + ([{"params": [B], "lr": args.b_lr}] if args.b_lr > 0 else [])
 
         def even():
             return even_frames_prev(prev, a, c, B)
