@@ -69,6 +69,8 @@ def main():
     ap.add_argument("--bits", type=int, default=8, help="저장 비트 수 (평가에 반영)")
     ap.add_argument("--project", action="store_true", help="스텝마다 가중치를 --bits 격자로 투영 (양자화 인지 미세조정)")
     ap.add_argument("--full-eval", action="store_true", help="끝나고 600장 전체 평가")
+    ap.add_argument("--loss", default="cehinge", choices=("cehinge", "flip"),
+                    help="cehinge: CE + margin 2 hinge / flip: 앞 절반 softplus margin(τ 0.2), 뒤 절반 sigmoid(-margin/τ) 로 '뒤집힐 확률' 을 직접 줄인다 (τ 0.15→0.05)")
     args = ap.parse_args()
 
     from livevis import LiveVis
@@ -80,8 +82,9 @@ def main():
     widths = tuple(int(v) for v in args.widths.split(",")) if args.widths else None
     G = make_renderer((args.width, args.fdim, len(seg), (1, 1, 2, 4)) if args.arch == "v2" else widths)
     if args.widen_from:
-        old = Renderer()
-        old.load_state_dict(torch.load(args.widen_from))
+        sd_old = torch.load(args.widen_from)
+        old = Renderer(*(sd_old[f"{k}.0.weight"].shape[0] for k in ("e1", "e2", "e3")))  # 폭은 체크포인트에서 읽는다
+        old.load_state_dict(sd_old)
         G = widen_renderer(old, *widths)
     net.segnet.to(memory_format=torch.channels_last)
     if args.resume:
@@ -108,12 +111,18 @@ def main():
             with torch.autocast("cpu", dtype=torch.bfloat16, enabled=not args.fp32):
                 logits = net.segnet(img)
             logits = logits.float()
-            ce = F.cross_entropy(logits, m)
-            # argmax 를 뒤집는 데 직접 관여하는 margin 손실: 정답 logit 이 다른 것보다 2 이상 크게
             true = logits.gather(1, m[:, None])[:, 0]
             other = logits.scatter(1, m[:, None], -1e4).amax(1)
-            hinge = F.relu(2.0 - (true - other)).mean()
-            loss = ce + hinge
+            margin = true - other
+            if args.loss == "flip":
+                prog = step / max(steps - 1, 1)
+                if prog < 0.5:
+                    loss = (F.softplus(-margin / 0.2) * 0.2).mean()
+                else:
+                    loss = torch.sigmoid(-margin / (0.15 - 0.2 * (prog - 0.5))).mean()
+            else:
+                # argmax 를 뒤집는 데 직접 관여하는 margin 손실: 정답 logit 이 다른 것보다 2 이상 크게
+                loss = F.cross_entropy(logits, m) + F.relu(2.0 - margin).mean()
             opt.zero_grad()
             loss.backward()
             opt.step()
