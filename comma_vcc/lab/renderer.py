@@ -84,6 +84,7 @@ def main():
     ap.add_argument("--project", action="store_true", help="스텝마다 가중치를 --bits 격자로 투영 (양자화 인지 미세조정)")
     ap.add_argument("--qat", action="store_true", help="STE 가짜 양자화로 학습 (--bits 격자, float 원본 가중치 유지)")
     ap.add_argument("--full-eval", action="store_true", help="끝나고 600장 전체 평가")
+    ap.add_argument("--start-epoch", type=int, default=0, help="--resume 와 함께: 이 에폭부터 (학습률 일정을 그만큼 진행시킨다, 컨테이너 재시작 대비)")
     ap.add_argument("--loss", default="cehinge", choices=("cehinge", "flip"),
                     help="cehinge: CE + margin 2 hinge / flip: 앞 절반 softplus margin(τ 0.2), 뒤 절반 sigmoid(-margin/τ) 로 '뒤집힐 확률' 을 직접 줄인다 (τ 0.15→0.05)")
     args = ap.parse_args()
@@ -116,7 +117,10 @@ def main():
 
     step = 0
     t0 = time.time()
-    for ep in range(args.epochs):
+    for _ in range(args.start_epoch * (len(seg) // args.bs)):
+        sched.step()
+        step += 1
+    for ep in range(args.start_epoch, args.epochs):
         perm = np.random.default_rng(ep).permutation(len(seg))
         for b in range(0, len(perm) - args.bs + 1, args.bs):
             m = torch.from_numpy(seg[perm[b : b + args.bs]]).long()
