@@ -35,6 +35,20 @@ def png(arr: np.ndarray) -> bytes:
     return b.getvalue()
 
 
+def ste_params(G, bits):
+    """QAT: pack_state 와 같은 격자로 가짜 양자화한 파라미터 (기울기는 float 원본으로 그대로 흐른다)."""
+    qmax = 2 ** (bits - 1) - 1
+    out = {}
+    for k, p in G.named_parameters():
+        if p.ndim >= 2:
+            s = (p.detach().abs().reshape(p.shape[0], -1).amax(1).clamp_min(1e-8) / qmax).half().float().view(-1, *[1] * (p.ndim - 1))
+            q = (p / s).round().clamp(-qmax, qmax) * s
+        else:
+            q = p.half().float()
+        out[k] = p + (q - p).detach()
+    return out
+
+
 @torch.inference_mode()
 def evaluate(G, net, seg, idx, bs=8, rounded=False, bits=8):
     """inflate 와 같은 조건: 저장/복원 왕복 가중치, float 출력 (서브픽셀 확장으로 거의 그대로 전달된다)."""
@@ -68,6 +82,7 @@ def main():
     ap.add_argument("--widen-from", default=None, help="이 v1 체크포인트를 --widths 로 넓혀서 시작 (처음엔 같은 출력)")
     ap.add_argument("--bits", type=int, default=8, help="저장 비트 수 (평가에 반영)")
     ap.add_argument("--project", action="store_true", help="스텝마다 가중치를 --bits 격자로 투영 (양자화 인지 미세조정)")
+    ap.add_argument("--qat", action="store_true", help="STE 가짜 양자화로 학습 (--bits 격자, float 원본 가중치 유지)")
     ap.add_argument("--full-eval", action="store_true", help="끝나고 600장 전체 평가")
     ap.add_argument("--loss", default="cehinge", choices=("cehinge", "flip"),
                     help="cehinge: CE + margin 2 hinge / flip: 앞 절반 softplus margin(τ 0.2), 뒤 절반 sigmoid(-margin/τ) 로 '뒤집힐 확률' 을 직접 줄인다 (τ 0.15→0.05)")
@@ -105,7 +120,10 @@ def main():
         perm = np.random.default_rng(ep).permutation(len(seg))
         for b in range(0, len(perm) - args.bs + 1, args.bs):
             m = torch.from_numpy(seg[perm[b : b + args.bs]]).long()
-            img = render(G, m, torch.from_numpy(perm[b : b + args.bs]))
+            if args.qat:
+                img = torch.func.functional_call(G, ste_params(G, args.bits), (m,))
+            else:
+                img = render(G, m, torch.from_numpy(perm[b : b + args.bs]))
             if args.round:
                 img = quantize_ste(img)
             with torch.autocast("cpu", dtype=torch.bfloat16, enabled=not args.fp32):
