@@ -40,6 +40,7 @@ def main():
     ap.add_argument("--bbits", type=int, default=6)
     ap.add_argument("--plain-epochs", type=int, default=0, help="본 학습(가중/B 학습) 뒤 B 고정 + 일반 MSE 로 더 학습할 에폭")
     ap.add_argument("--dimw", type=float, default=0.0, help="본 학습 손실의 차원별 가중 (1/분산)^dimw (양자화 단계는 일반 MSE)")
+    ap.add_argument("--resume", action="store_true", help="--out + '.state.pt' 체크포인트에서 이어서 (컨테이너 재시작 대비, 10 에폭마다 저장)")
     args = ap.parse_args()
     from livevis import LiveVis
 
@@ -70,9 +71,14 @@ def main():
         with torch.inference_mode():
             return torch.cat([pose_out(net, even_frames_prev(prev[b], a[j], c[j], B.detach()), odd[b]) for j, b in enumerate(batches)]) - target
 
-    def run(epochs, lr, q=None, weighted=True, with_b=True):
+    state_path = args.out + ".state.pt"
+
+    def save_state(phase, ep):
+        torch.save({"phase": phase, "ep": ep, "A": [x.detach() for x in A], "C": [x.detach() for x in C], "B": B.detach(), "B_new": B_new}, state_path)
+
+    def run(epochs, lr, q=None, weighted=True, with_b=True, phase=None, start=0):
         opts = [torch.optim.Adam([A[j], C[j]], lr=lr) for j in range(len(batches))]
-        for ep in range(epochs):
+        for ep in range(start, epochs):
             cur_lr = lr * (0.02 + 0.98 * 0.5 * (1 + np.cos(np.pi * ep / max(epochs, 1))))
             for j, b in enumerate(batches):
                 for g in opts[j].param_groups:
@@ -100,10 +106,25 @@ def main():
                 d = err.pow(2).mean().item()
                 viz.log(ep, posenet_dist=d, pose_term=float(np.sqrt(10 * d)))
                 print(f"epoch {ep + 1}: posenet_dist {d:.7f} term {np.sqrt(10 * d):.4f} 차원별 RMS {err.pow(2).mean(0).sqrt().numpy().round(4)} ({time.time() - t0:.0f}s)", flush=True)
+            if phase and (ep % 10 == 9 or ep == epochs - 1):
+                save_state(phase, ep + 1)
 
-    run(args.epochs, args.lr)
     B_new = None
-    if opt_B is not None:  # 기저를 저장 비트로 고정
+    phase, start = "main", 0
+    if args.resume:
+        st = torch.load(state_path, weights_only=False)
+        phase, start = st["phase"], st["ep"]
+        with torch.no_grad():
+            for x, y in zip(A + C, st["A"] + st["C"]):
+                x.copy_(y)
+        B, B_new = st["B"].clone().requires_grad_(B.requires_grad and phase == "main"), st["B_new"]
+        if opt_B is not None and phase == "main":
+            opt_B = torch.optim.Adam([B], lr=args.train_b)
+        print(f"이어서: {phase} 에폭 {start} 부터", flush=True)
+    if phase == "main":
+        run(args.epochs, args.lr, phase="main", start=start)
+        start = 0
+    if opt_B is not None and phase == "main":  # 기저를 저장 비트로 고정
         with torch.no_grad():
             bq = 2 ** (args.bbits - 1) - 1
             B_scale_new = B.abs().amax((1, 2, 3)) / bq
@@ -111,7 +132,7 @@ def main():
             B = (B_q_new * B_scale_new.view(-1, 1, 1, 1)).detach()
             B_new = (B_q_new.numpy().astype(np.int8), B_scale_new.numpy().astype(np.float32))
     if args.plain_epochs:
-        run(args.plain_epochs, args.lr, weighted=False, with_b=False)
+        run(args.plain_epochs, args.lr, weighted=False, with_b=False, phase="plain", start=start)
 
     # 격자 양자화
     with torch.no_grad():
