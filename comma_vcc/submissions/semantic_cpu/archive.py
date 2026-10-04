@@ -150,3 +150,71 @@ def unpack_pose2(buf: bytes):
         "c": torch.from_numpy((c_int * c_step.astype(np.float64)).astype(np.float32)),
         "a": torch.from_numpy((a_int * a_step.astype(np.float64)).astype(np.float32)),
     }
+
+
+# ---------------------------------------------------------------- pose v3: pose v2 와 같은 값, 계수만 Rice 부호
+# 계수는 시간 상관이 거의 없어서 (차분하면 오히려 분산이 2배) 차분 + xz 대신 행별 (값 - 평균) 을 Rice 부호로 쓴다.
+def rice_encode(rows: np.ndarray) -> bytes:
+    """(r, n) 정수 → 행마다 [i32 평균][u8 k] + 비트열 (zigzag → q 개의 1, 0, k 비트 나머지)."""
+    head, bits = [], []
+    for row in rows.astype(np.int64):
+        m = int(np.round(row.mean()))
+        v = row - m
+        z = np.where(v >= 0, 2 * v, -2 * v - 1)
+        k = min(range(16), key=lambda kk: int(((z >> kk) + 1 + kk).sum()))
+        head.append(struct.pack("<iB", m, k))
+        for x in z.tolist():
+            bits.extend([1] * (x >> k) + [0] + [(x >> (k - 1 - j)) & 1 for j in range(k)])
+    return b"".join(head) + np.packbits(np.array(bits, np.uint8)).tobytes()
+
+
+def rice_decode(buf: bytes, r: int, n: int) -> np.ndarray:
+    hs = struct.calcsize("<iB")
+    params = [struct.unpack_from("<iB", buf, i * hs) for i in range(r)]
+    bits = np.unpackbits(np.frombuffer(buf, np.uint8, offset=r * hs)).tolist()
+    out = np.zeros((r, n), np.int64)
+    pos = 0
+    for i, (m, k) in enumerate(params):
+        for j in range(n):
+            q = 0
+            while bits[pos]:
+                q += 1
+                pos += 1
+            pos += 1
+            rem = 0
+            for _ in range(k):
+                rem = (rem << 1) | bits[pos]
+                pos += 1
+            z = (q << k) | rem
+            out[i, j] = m + (z >> 1 if z % 2 == 0 else -((z + 1) >> 1))
+    return out
+
+
+def pose2_to_pose3(blob2: bytes) -> bytes:
+    """pose2 blob → pose3 blob (무손실 재포장)."""
+    n, k, C, bh, bw = struct.unpack_from("<HHBHH", blob2, 0)
+    hl = struct.calcsize("<HHBHH")
+    body = unxz(blob2[hl:])
+    fixed = 4 * (k + 6 + k) + k * C * bh * bw
+    d = np.frombuffer(body, np.int16, (k + 6) * n, fixed).reshape(k + 6, n)
+    vals = np.cumsum(d.astype(np.int64), axis=1)
+    xzpart = xz(body[:fixed])
+    return blob2[:hl] + struct.pack("<I", len(xzpart)) + xzpart + rice_encode(vals)
+
+
+def unpack_pose3(buf: bytes):
+    n, k, C, bh, bw = struct.unpack_from("<HHBHH", buf, 0)
+    hl = struct.calcsize("<HHBHH")
+    (lx,) = struct.unpack_from("<I", buf, hl)
+    body = unxz(buf[hl + 4 : hl + 4 + lx])
+    vals = rice_decode(buf[hl + 4 + lx :], k + 6, n)
+    c_step = np.frombuffer(body, np.float32, k, 0)
+    a_step = np.frombuffer(body, np.float32, 6, 4 * k)
+    B_scale = np.frombuffer(body, np.float32, k, 4 * (k + 6))
+    B_q = np.frombuffer(body, np.int8, k * C * bh * bw, 4 * (2 * k + 6)).reshape(k, C, bh, bw)
+    c_int, a_int = vals[:k].T, vals[k:].T
+    return {
+        "B": torch.from_numpy(B_q.astype(np.float32) * B_scale.reshape(k, 1, 1, 1)),
+        "c": torch.from_numpy((c_int * c_step.astype(np.float64)).astype(np.float32)),
+        "a": torch.from_numpy((a_int * a_step.astype(np.float64)).astype(np.float32)),
+    }

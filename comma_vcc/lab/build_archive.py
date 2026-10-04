@@ -68,7 +68,7 @@ def main():
     cfg = parse_rcfg(args.renderer_cfg, len(seg))
     rend = archive.pack_renderer(cfg, pack_state(torch.load(args.renderer), args.rbits))
     if args.pose2:
-        pose_sec = ("pos2", open(args.pose2, "rb").read())
+        pose_sec = ("pos3", archive.pose2_to_pose3(open(args.pose2, "rb").read()))
     else:
         pose_sec = ("carr", open(args.carrier, "rb").read())
     p = archive.pack({"ctxn": ctxn, "segs": segs, "rend": rend, pose_sec[0]: pose_sec[1]})
