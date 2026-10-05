@@ -14,9 +14,9 @@ H, W = 874, 1164  # 원본 해상도
 
 
 # ---------------------------------------------------------------- 렌더러: seg 맵 → 홀수 프레임
-def coords(n: int) -> torch.Tensor:
-    ys = torch.linspace(-1, 1, SH).view(1, 1, SH, 1).expand(n, 1, SH, SW)
-    xs = torch.linspace(-1, 1, SW).view(1, 1, 1, SW).expand(n, 1, SH, SW)
+def coords(n: int, device=None) -> torch.Tensor:
+    ys = torch.linspace(-1, 1, SH, device=device).view(1, 1, SH, 1).expand(n, 1, SH, SW)
+    xs = torch.linspace(-1, 1, SW, device=device).view(1, 1, 1, SW).expand(n, 1, SH, SW)
     return torch.cat([ys, xs], 1)
 
 
@@ -49,8 +49,8 @@ class Renderer(nn.Module):
         return x * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
 
     def forward(self, seg: torch.Tensor, idx: torch.Tensor | None = None) -> torch.Tensor:
-        x = torch.cat([F.one_hot(seg.long(), 5).permute(0, 3, 1, 2).float(), coords(seg.shape[0])], 1)
-        f = self.frame(idx if idx is not None else torch.zeros(seg.shape[0], dtype=torch.long)) if self.fdim else None
+        x = torch.cat([F.one_hot(seg.long(), 5).permute(0, 3, 1, 2).float(), coords(seg.shape[0], seg.device)], 1)
+        f = self.frame((idx if idx is not None else torch.zeros(seg.shape[0], dtype=torch.long)).to(seg.device)) if self.fdim else None
         f1 = self.e1(x)
         f2 = self.e2(F.avg_pool2d(f1, 2))
         f3 = self.e3(F.avg_pool2d(f2, 2))
@@ -98,10 +98,10 @@ class RendererV2(nn.Module):
 
     def forward(self, seg: torch.Tensor, idx: torch.Tensor | None = None) -> torch.Tensor:
         n = seg.shape[0]
-        c = coords(n)
+        c = coords(n, seg.device)
         x = torch.cat([F.one_hot(seg.long(), 5).permute(0, 3, 1, 2).float(), c, c * c], 1)
         x = self.embed(x.contiguous(memory_format=torch.channels_last))
-        f = self.frame(idx if idx is not None else torch.zeros(n, dtype=torch.long))
+        f = self.frame((idx if idx is not None else torch.zeros(n, dtype=torch.long)).to(seg.device))
         for b in self.blocks:
             x = b(x, f)
         return torch.sigmoid(self.head(F.gelu(x))) * 255
@@ -170,7 +170,7 @@ def pack_state(sd: dict, bits: int = 8) -> bytes:
     out = [struct.pack("<HB", len(sd), bits)]
     qmax = 2 ** (bits - 1) - 1
     for k, v in sd.items():
-        v = v.detach().float()
+        v = v.detach().float().cpu()
         if v.ndim >= 2:
             s = (v.abs().reshape(v.shape[0], -1).amax(1).clamp_min(1e-8) / qmax).half().float().clamp_min(1e-8)  # 0 행 (fp16 에서 0) 대비
             q = (v / s.view(-1, *[1] * (v.ndim - 1))).round().clamp(-qmax, qmax).to(torch.int8)
@@ -237,7 +237,7 @@ AFF_SCALE = torch.tensor([0.01, 0.01, 2 / SW, 0.01, 0.01, 2 / SH])  # 행렬 원
 
 def affine(img: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
     """img (n,3,H,W), a (n,6) = [a11-1, a12, tx(px), a21, a22-1, ty(px)] (스케일 전) → bilinear 재샘플."""
-    a = a * AFF_SCALE
+    a = a * AFF_SCALE.to(a.device)
     th = torch.stack([torch.stack([1 + a[:, 0], a[:, 1], a[:, 2]], 1), torch.stack([a[:, 3], 1 + a[:, 4], a[:, 5]], 1)], 1)
     g = F.affine_grid(th, list(img.shape), align_corners=False)
     return F.grid_sample(img, g, mode="bilinear", padding_mode="border", align_corners=False)

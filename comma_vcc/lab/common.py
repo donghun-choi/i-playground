@@ -40,7 +40,7 @@ def score(seg: float, pose: float, nbytes: int) -> dict:
 _NET = None
 
 
-def nets() -> DistortionNet:
+def nets(device="cpu") -> DistortionNet:
     global _NET
     if _NET is None:
         net = DistortionNet().eval()
@@ -48,7 +48,17 @@ def nets() -> DistortionNet:
         for p in net.parameters():
             p.requires_grad_(False)
         _NET = net
-    return _NET
+    return _NET.to(device)
+
+
+def setup_device(name: str) -> torch.device:
+    """--device 인자 → torch.device. GPU 에서는 TF32 를 끈다 (flip 손실은 margin 근처 정밀도에 민감)."""
+    dev = torch.device(name)
+    if dev.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = True
+    return dev
 
 
 def downsample(frames_u8: torch.Tensor) -> torch.Tensor:
@@ -92,7 +102,7 @@ def gt_frames():
 
 def load_gt():
     """캐시된 GT: small (1200,3,384,512) float32 memmap, seg (600,384,512) uint8, pose (600,6) float32."""
-    small = np.load(CACHE / "gt_small.npy", mmap_mode="r")
+    small = np.load(CACHE / "gt_small.npy", mmap_mode="r") if (CACHE / "gt_small.npy").exists() else None  # Colab 경량 캐시에는 없다
     seg = np.load(CACHE / "gt_seg.npy")
     pose = np.load(CACHE / "gt_pose.npy")
     return small, seg, pose
