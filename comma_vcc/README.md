@@ -35,7 +35,7 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v5c, 점수 0.1865)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v5d, 점수 0.1780)
 
 ```
 archive (202KB) = 정수 문맥 CNN (17KB) + seg 맵 601장 무손실 스트림 (124KB) + 렌더러 (31KB, 폭 24·32·40, 4비트) + pose (30KB, 계수는 Rice 부호)
@@ -60,7 +60,7 @@ seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본
 | `lab/build_archive.py` | 정수화 + 인코드 + archive.zip 조립 |
 | 나머지 `lab/*_exp.py`, `analyze.py`, `seg_errors.py`, `bits_breakdown.py` | 실험/분석 |
 
-### v5c 재현 (CPU 4코어, 대략 25시간)
+### v5d 재현 (CPU 4코어, 대략 30시간)
 ```bash
 cd comma_vcc/lab
 ../.venv/bin/python build_cache.py                                                   # 3분
@@ -90,7 +90,11 @@ cd comma_vcc/lab
 ../.venv/bin/python renderer.py --widths 24,32,40 --resume ../cache/renderer_w24flip5.pt --epochs 10 --lr 4e-4 --cosine --fp32 --bits 4 --qat --loss flip --full-eval --out ../cache/renderer_w24flip4.pt
 ../.venv/bin/python renderer.py --widths 24,32,40 --resume ../cache/renderer_w24flip4.pt --epochs 12 --lr 3e-4 --cosine --fp32 --bits 4 --qat --loss flip --full-eval --out ../cache/renderer_w24flip4b.pt
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v5b2.bin --renderer ../cache/renderer_w24flip4b.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 10 --epochs 150 --lr 0.01 --train-b 0.02 --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_v5c.bin
-../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24d2.pt --cbits 6 --renderer ../cache/renderer_w24flip4b.pt --renderer-cfg 24,32,40 --rbits 4 --pose2 ../cache/pose2_v5c.bin
+# (여기까지가 v5c) v5d: 렌더러 10에폭 더 (FiLM 없이), pose 200에폭 (v5c 다듬기 결과에서 이어서)
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v5c.bin --renderer ../cache/renderer_w24flip4b.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 10 --epochs 40 --lr 0.001 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_v5c2.bin
+../.venv/bin/python renderer.py --widths 24,32,40 --resume ../cache/renderer_w24flip4b.pt --epochs 10 --lr 3e-4 --cosine --fp32 --bits 4 --qat --loss flip --full-eval --out ../cache/renderer_w24flip4c.pt
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v5c2.bin --renderer ../cache/renderer_w24flip4c.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 10 --epochs 200 --lr 0.01 --train-b 0.02 --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_v5d.bin
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24d2.pt --cbits 6 --renderer ../cache/renderer_w24flip4c.pt --renderer-cfg 24,32,40 --rbits 4 --pose2 ../cache/pose2_v5d.bin
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -190,3 +194,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v5a | 0.00121 | 0.0000162 | 0.00590 | **0.2810** | pose: 완전 정규화 손실 + B 학습 150에폭 → 일반 MSE 다듬기 (회전/좌우 차원을 처음으로 맞춤), pose 계수 Rice 부호 (-2.2KB). inflate 392s + 평가 238s |
 | semantic_cpu v5b | 0.000506 | 0.0000453 | 0.00564 | **0.2128** | 렌더러 flip 손실(뒤집힐 확률) + 5비트 QAT (seg 항 0.121 → 0.051, 렌더러 -9.6KB), pose 재피팅. inflate 371s + 평가 226s |
 | semantic_cpu v5c | 0.000440 | 0.0000066 | 0.00538 | **0.1865** | 렌더러 4비트 QAT + flip 22에폭 더 (30.5KB), pose 150에폭 다시 (기저 이어서). inflate 367s + 평가 231s |
+| semantic_cpu v5d | 0.000378 | 0.0000035 | 0.00538 | **0.1780** | 렌더러 4비트 flip 10에폭 더, pose 200에폭 (기저를 계속 이어 학습할수록 회전 차원이 더 맞음). inflate 369s + 평가 228s |
