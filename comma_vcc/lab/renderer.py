@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from common import CACHE, SH, SW, load_gt, nets
+from common import CACHE, SH, SW, load_gt, nets, setup_device
 import copy
 
 from model import Renderer, fake_quant_, make_renderer, quantize_roundtrip, render, widen_renderer  # noqa: E402  (제출물 패키지와 같은 정의)
@@ -54,18 +54,21 @@ def evaluate(G, net, seg, idx, bs=8, rounded=False, bits=8):
     """inflate 와 같은 조건: 저장/복원 왕복 가중치, float 출력 (서브픽셀 확장으로 거의 그대로 전달된다)."""
     Gq = copy.deepcopy(G)
     quantize_roundtrip(Gq, bits)
+    dev = next(Gq.parameters()).device
     errs = []
     for i in range(0, len(idx), bs):
-        m = torch.from_numpy(seg[idx[i : i + bs]])
+        m = torch.from_numpy(seg[idx[i : i + bs]]).to(dev)
         img = render(Gq, m, torch.from_numpy(np.asarray(idx[i : i + bs])))
         out = net.segnet(img.round() if rounded else img).argmax(1)
-        errs.append((out != m).float().mean((1, 2)))
+        errs.append((out != m).float().mean((1, 2)).cpu())
     return torch.cat(errs)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--device", default="cpu", help="cpu | cuda (Colab GPU)")
+    ap.add_argument("--limit", type=int, default=0, help="> 0 이면 앞 N장만 (드라이버 점검용)")
     ap.add_argument("--bs", type=int, default=4)
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--threads", type=int, default=4)
@@ -94,24 +97,28 @@ def main():
 
     torch.set_num_threads(args.threads)
     torch.manual_seed(0)
-    net = nets()
+    dev = setup_device(args.device)
+    net = nets(dev)
     _, seg, _ = load_gt()
+    if args.limit:
+        seg = seg[: args.limit]
     widths = tuple(int(v) for v in args.widths.split(",")) if args.widths else None
     if args.film:
         widths = (widths or (16, 24, 32)) + (args.film, len(seg))
     G = make_renderer((args.width, args.fdim, len(seg), (1, 1, 2, 4)) if args.arch == "v2" else widths)
     if args.widen_from:
-        sd_old = torch.load(args.widen_from)
+        sd_old = torch.load(args.widen_from, map_location="cpu")
         old = Renderer(*(sd_old[f"{k}.0.weight"].shape[0] for k in ("e1", "e2", "e3")))  # 폭은 체크포인트에서 읽는다
         old.load_state_dict(sd_old)
         G = widen_renderer(old, *widths)
     net.segnet.to(memory_format=torch.channels_last)
     if args.resume:
-        missing, unexpected = G.load_state_dict(torch.load(args.resume), strict=False)
+        missing, unexpected = G.load_state_dict(torch.load(args.resume, map_location="cpu"), strict=False)
         assert not unexpected and all(k.startswith(("frame.", "film")) for k in missing), (missing, unexpected)
         if missing:
             print(f"체크포인트에 없는 FiLM 파라미터는 초기값(변조 없음)으로 시작: {missing}")
-    print(f"renderer params: {sum(p.numel() for p in G.parameters()):,}")
+    G.to(dev)
+    print(f"renderer params: {sum(p.numel() for p in G.parameters()):,} ({dev})")
     opt = torch.optim.Adam(G.parameters(), lr=args.lr)
     steps = args.epochs * (len(seg) // args.bs)
     if args.cosine:
@@ -119,7 +126,7 @@ def main():
     else:
         sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.05)
     viz = LiveVis("comma vcc · 렌더러 학습", port=args.port).start()
-    val_idx = np.arange(5, 600, 25)  # 24장 고정 검증
+    val_idx = np.arange(5, len(seg), 25) if len(seg) > 25 else np.arange(len(seg))  # 24장 고정 검증
 
     step = 0
     t0 = time.time()
@@ -129,14 +136,14 @@ def main():
     for ep in range(args.start_epoch, args.epochs):
         perm = np.random.default_rng(ep).permutation(len(seg))
         for b in range(0, len(perm) - args.bs + 1, args.bs):
-            m = torch.from_numpy(seg[perm[b : b + args.bs]]).long()
+            m = torch.from_numpy(seg[perm[b : b + args.bs]]).long().to(dev)
             if args.qat:
                 img = torch.func.functional_call(G, ste_params(G, args.bits), (m, torch.from_numpy(perm[b : b + args.bs])))
             else:
                 img = render(G, m, torch.from_numpy(perm[b : b + args.bs]))
             if args.round:
                 img = quantize_ste(img)
-            with torch.autocast("cpu", dtype=torch.bfloat16, enabled=not args.fp32):
+            with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=not args.fp32):
                 logits = net.segnet(img)
             logits = logits.float()
             true = logits.gather(1, m[:, None])[:, 0]
@@ -163,19 +170,20 @@ def main():
             viz.log(step, loss=loss.item(), train_disagreement_bf16=err, lr=sched.get_last_lr()[0])
             if step % 50 == 0:
                 print(f"ep {ep} step {step}/{steps} loss {loss.item():.4f} err {err:.5f} ({time.time() - t0:.0f}s)", flush=True)
-        errs = evaluate(G, net, seg, val_idx, bits=args.bits)
+        errs = evaluate(G, net, seg, val_idx, bits=args.bits, bs=16 if dev.type == "cuda" else 8)
         viz.log(step, val_disagreement_fp32=errs.mean().item(), val_seg_term=100 * errs.mean().item())
         with torch.inference_mode():
-            m = torch.from_numpy(seg[val_idx[:1]])
+            m = torch.from_numpy(seg[val_idx[:1]]).to(dev)
             img = render(G, m, torch.from_numpy(val_idx[:1]))
             out = net.segnet(img).argmax(1)
+            img, out, m = img.cpu(), out.cpu(), m.cpu()
         vis = np.concatenate([img[0].round().clamp(0, 255).permute(1, 2, 0).byte().numpy(), PALETTE[out[0].numpy()]], 1)
         vis[:, SW:][(out[0] != m[0]).numpy()] = [255, 0, 255]
         viz.image("render", png(vis), step=step, caption=f"epoch {ep}: 왼쪽 렌더, 오른쪽 SegNet 결과(분홍=불일치). val {errs.mean():.5f}")
-        torch.save(G.state_dict(), args.out)
+        torch.save({k: v.detach().cpu() for k, v in G.state_dict().items()}, args.out)
         print(f"== epoch {ep} val disagreement {errs.mean():.5f} (max {errs.max():.5f})", flush=True)
     if args.full_eval:
-        errs = evaluate(G, net, seg, np.arange(len(seg)), bits=args.bits)
+        errs = evaluate(G, net, seg, np.arange(len(seg)), bits=args.bits, bs=16 if dev.type == "cuda" else 8)
         print(f"== 전체 600장 disagreement {errs.mean():.6f} → seg 항 {100 * errs.mean():.4f}", flush=True)
 
 

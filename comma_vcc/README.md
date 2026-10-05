@@ -98,6 +98,17 @@ cd comma_vcc/lab
 cd .. && bash run.sh semantic_cpu
 ```
 
+### GPU (Colab) 로 길게 학습하기
+CPU 로는 렌더러 flip 학습 1에폭이 약 8분이라, 같은 레시피를 Colab GPU 에서 길게 돌린다.
+`colab/vcc_gpu.ipynb` 를 Colab 에서 열고 위에서부터 실행하면 된다 (GPU 런타임, 보안 비밀 `GH_TOKEN` = 이 저장소 Contents 쓰기 토큰).
+
+- `colab/setup_colab.sh`: 챌린지 코드 + 평가 네트워크 가중치(해시 확인) + 경량 캐시 (`colab/seed/`: GT seg 맵 xz 512KB, pose, 시작 렌더러/pose). 원본 영상은 필요 없다.
+- `colab/run_jobs.py`: 렌더러 사이클(flip 10에폭 + 600장 평가, 가장 좋은 것을 이어서) → 최고 렌더러에 pose 재피팅.
+  사이클마다 `colab/results/` 를 `colab-results` 브랜치로 push, 끊기면 다시 실행해서 이어 한다. `--smoke` 는 CPU 에서 흐름만 점검 (앞 8장).
+- 실시간 시각화: livevis 를 Colab 포트 프록시로 연다 (렌더러 8020, pose 8014).
+- 학습 스크립트는 `--device cuda` 를 받는다 (GPU 에서는 TF32 를 끈다: flip 손실이 margin 근처 정밀도에 민감).
+- 결과(renderer_best.pt, pose2_best.bin)는 CPU 쪽에서 `build_archive.py` 로 묶고 공식과 같은 CPU 평가로 확인한다.
+
 ### 시간 제한에 대해
 우리 머신 (4코어 AVX-512, fp32 행렬곱 632 GFLOPS) 에서 v4 는 inflate 378s + 평가 242s = 10.4분.
 공식 러너는 GitHub `ubuntu-latest` (4 vCPU) 이고 30분에는 환경 준비(apt, uv sync, LFS)도 포함된다.

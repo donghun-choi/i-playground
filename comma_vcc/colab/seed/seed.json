@@ -1,0 +1,7 @@
+{
+  "renderer": "renderer_w24flip4c.pt (24,32,40, 4비트 QAT, flip 손실)",
+  "renderer_disagreement": 0.000378,
+  "pose": "pose2_v5d2.bin",
+  "posenet": 3.16e-06,
+  "score_cpu_eval": 0.1778
+}

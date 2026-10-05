@@ -21,18 +21,18 @@ from model import parse_rcfg  # noqa: E402
 from model import even_frames_prev, expand_fine, make_renderer, quantize_roundtrip, render  # noqa: E402
 
 
-def renders(renderer_path, cfg, seg, pre, bits=8, bs=8):
+def renders(renderer_path, cfg, seg, pre, bits=8, bs=8, device="cpu"):
     """inflate 와 같은 홀수 프레임과 '이전 프레임' 들."""
     G = make_renderer(cfg)
-    G.load_state_dict(torch.load(renderer_path))
+    G.load_state_dict(torch.load(renderer_path, map_location="cpu"))
     quantize_roundtrip(G, bits)
-    G.eval()
+    G.eval().to(device)
     n = len(seg)
-    odd = torch.zeros(n, 3, SH, SW)
+    odd = torch.zeros(n, 3, SH, SW, device=device)
     with torch.inference_mode():
         for i in range(0, n, bs):
-            odd[i : i + bs] = render(G, torch.from_numpy(seg[i : i + bs]), torch.arange(i, min(i + bs, n)))
-        prev0 = render(G, torch.from_numpy(pre), torch.zeros(1, dtype=torch.long))
+            odd[i : i + bs] = render(G, torch.from_numpy(seg[i : i + bs]).to(device), torch.arange(i, min(i + bs, n)))
+        prev0 = render(G, torch.from_numpy(pre).to(device), torch.zeros(1, dtype=torch.long))
     return odd, torch.cat([prev0, odd[:-1]])
 
 

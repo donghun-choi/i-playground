@@ -12,3 +12,4 @@ comma_vcc/submissions/*/inflated/
 comma_vcc/*.log
 comma_vcc/cache/
 comma_vcc/submissions/*/live_report.txt
+comma_vcc/colab/results_smoke/
