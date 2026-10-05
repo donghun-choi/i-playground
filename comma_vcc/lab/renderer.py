@@ -41,7 +41,7 @@ def ste_params(G, bits):
     out = {}
     for k, p in G.named_parameters():
         if p.ndim >= 2:
-            s = (p.detach().abs().reshape(p.shape[0], -1).amax(1).clamp_min(1e-8) / qmax).half().float().view(-1, *[1] * (p.ndim - 1))
+            s = (p.detach().abs().reshape(p.shape[0], -1).amax(1).clamp_min(1e-8) / qmax).half().float().clamp_min(1e-8).view(-1, *[1] * (p.ndim - 1))
             q = (p / s).round().clamp(-qmax, qmax) * s
         else:
             q = p.half().float()
@@ -79,6 +79,7 @@ def main():
     ap.add_argument("--width", type=int, default=48)
     ap.add_argument("--fdim", type=int, default=8)
     ap.add_argument("--widths", default=None, help="v1 폭 c1,c2,c3 (예: 24,32,40)")
+    ap.add_argument("--film", type=int, default=0, help="> 0 이면 v1 에 프레임별 FiLM (이 차원의 프레임 코드). --resume 이 FiLM 없는 체크포인트면 FiLM 0 에서 시작")
     ap.add_argument("--widen-from", default=None, help="이 v1 체크포인트를 --widths 로 넓혀서 시작 (처음엔 같은 출력)")
     ap.add_argument("--bits", type=int, default=8, help="저장 비트 수 (평가에 반영)")
     ap.add_argument("--project", action="store_true", help="스텝마다 가중치를 --bits 격자로 투영 (양자화 인지 미세조정)")
@@ -96,6 +97,8 @@ def main():
     net = nets()
     _, seg, _ = load_gt()
     widths = tuple(int(v) for v in args.widths.split(",")) if args.widths else None
+    if args.film:
+        widths = (widths or (16, 24, 32)) + (args.film, len(seg))
     G = make_renderer((args.width, args.fdim, len(seg), (1, 1, 2, 4)) if args.arch == "v2" else widths)
     if args.widen_from:
         sd_old = torch.load(args.widen_from)
@@ -104,7 +107,10 @@ def main():
         G = widen_renderer(old, *widths)
     net.segnet.to(memory_format=torch.channels_last)
     if args.resume:
-        G.load_state_dict(torch.load(args.resume))
+        missing, unexpected = G.load_state_dict(torch.load(args.resume), strict=False)
+        assert not unexpected and all(k.startswith(("frame.", "film")) for k in missing), (missing, unexpected)
+        if missing:
+            print(f"체크포인트에 없는 FiLM 파라미터는 초기값(변조 없음)으로 시작: {missing}")
     print(f"renderer params: {sum(p.numel() for p in G.parameters()):,}")
     opt = torch.optim.Adam(G.parameters(), lr=args.lr)
     steps = args.epochs * (len(seg) // args.bs)
@@ -125,7 +131,7 @@ def main():
         for b in range(0, len(perm) - args.bs + 1, args.bs):
             m = torch.from_numpy(seg[perm[b : b + args.bs]]).long()
             if args.qat:
-                img = torch.func.functional_call(G, ste_params(G, args.bits), (m,))
+                img = torch.func.functional_call(G, ste_params(G, args.bits), (m, torch.from_numpy(perm[b : b + args.bs])))
             else:
                 img = render(G, m, torch.from_numpy(perm[b : b + args.bs]))
             if args.round:

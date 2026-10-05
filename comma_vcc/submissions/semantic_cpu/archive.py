@@ -91,12 +91,15 @@ def dct_basis(k: int, bh: int, bw: int) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------- 렌더러
-# 헤더: arch(1 = v1 Renderer, 2 = RendererV2, 3 = 폭을 바꾼 v1), v2 이면 width, fdim, n_frames, dilation 4개, 3 이면 c1 c2 c3
+# 헤더: arch(1 = v1 Renderer, 2 = RendererV2, 3 = 폭을 바꾼 v1, 4 = 폭을 바꾼 v1 + 프레임별 FiLM), v2 이면 width, fdim, n_frames, dilation 4개,
+# 3 이면 c1 c2 c3, 4 이면 c1 c2 c3 fdim n_frames
 def pack_renderer(cfg, weights: bytes) -> bytes:
     if not cfg:
         head = struct.pack("<B", 1)
     elif len(cfg) == 3:
         head = struct.pack("<B3H", 3, *cfg)
+    elif len(cfg) == 5:
+        head = struct.pack("<B5H", 4, *cfg)
     else:
         width, fdim, n_frames, dils = cfg
         head = struct.pack("<BHBH4B", 2, width, fdim, n_frames, *dils)
@@ -109,6 +112,8 @@ def unpack_renderer(buf: bytes):
         return None, unxz(buf[1:])
     if buf[0] == 3:
         return tuple(struct.unpack_from("<3H", buf, 1)), unxz(buf[struct.calcsize("<B3H"):])
+    if buf[0] == 4:
+        return tuple(struct.unpack_from("<5H", buf, 1)), unxz(buf[struct.calcsize("<B5H"):])
     _, width, fdim, n_frames, *dils = struct.unpack_from("<BHBH4B", buf, 0)
     return (width, fdim, n_frames, tuple(dils)), unxz(buf[struct.calcsize("<BHBH4B"):])
 

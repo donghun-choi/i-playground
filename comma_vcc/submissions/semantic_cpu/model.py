@@ -21,25 +21,47 @@ def coords(n: int) -> torch.Tensor:
 
 
 class Renderer(nn.Module):
-    """작은 U-Net. 입력: one-hot(5) + 좌표(2). 출력: 0~255 RGB."""
+    """작은 U-Net. 입력: one-hot(5) + 좌표(2). 출력: 0~255 RGB.
 
-    def __init__(self, c1: int = 16, c2: int = 24, c3: int = 32):
+    fdim > 0 이면 프레임마다 fdim 차원 코드로 병목/디코더 특징을 FiLM 변조한다 (처음엔 0 이라 변조 없음).
+    """
+
+    def __init__(self, c1: int = 16, c2: int = 24, c3: int = 32, fdim: int = 0, n_frames: int = 0):
         super().__init__()
-        self.cfg = (c1, c2, c3)
+        self.cfg = (c1, c2, c3) + ((fdim, n_frames) if fdim else ())
+        self.fdim = fdim
         self.e1 = nn.Sequential(nn.Conv2d(7, c1, 3, padding=1), nn.ReLU(), nn.Conv2d(c1, c1, 3, padding=1), nn.ReLU())
         self.e2 = nn.Sequential(nn.Conv2d(c1, c2, 3, padding=1), nn.ReLU(), nn.Conv2d(c2, c2, 3, padding=1), nn.ReLU())
         self.e3 = nn.Sequential(nn.Conv2d(c2, c3, 3, padding=1), nn.ReLU(), nn.Conv2d(c3, c3, 3, padding=2, dilation=2), nn.ReLU())
         self.d2 = nn.Sequential(nn.Conv2d(c3 + c2, c2, 3, padding=1), nn.ReLU())
         self.d1 = nn.Sequential(nn.Conv2d(c2 + c1, c1, 3, padding=1), nn.ReLU())
         self.out = nn.Conv2d(c1, 3, 1)
+        if fdim:
+            self.frame = nn.Embedding(n_frames, fdim)
+            self.film3, self.film2, self.film1 = nn.Linear(fdim, 2 * c3), nn.Linear(fdim, 2 * c2), nn.Linear(fdim, 2 * c1)
+            for m in (self.film3, self.film2, self.film1):
+                nn.init.zeros_(m.weight)
+                nn.init.zeros_(m.bias)
 
-    def forward(self, seg: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _film(x, lin, f):
+        scale, shift = lin(f).chunk(2, dim=1)
+        return x * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
+
+    def forward(self, seg: torch.Tensor, idx: torch.Tensor | None = None) -> torch.Tensor:
         x = torch.cat([F.one_hot(seg.long(), 5).permute(0, 3, 1, 2).float(), coords(seg.shape[0])], 1)
+        f = self.frame(idx if idx is not None else torch.zeros(seg.shape[0], dtype=torch.long)) if self.fdim else None
         f1 = self.e1(x)
         f2 = self.e2(F.avg_pool2d(f1, 2))
         f3 = self.e3(F.avg_pool2d(f2, 2))
+        if f is not None:
+            f3 = self._film(f3, self.film3, f)
         u2 = self.d2(torch.cat([F.interpolate(f3, scale_factor=2, mode="bilinear"), f2], 1))
+        if f is not None:
+            u2 = self._film(u2, self.film2, f)
         u1 = self.d1(torch.cat([F.interpolate(u2, scale_factor=2, mode="bilinear"), f1], 1))
+        if f is not None:
+            u1 = self._film(u1, self.film1, f)
         return torch.sigmoid(self.out(u1)) * 255
 
 
@@ -86,18 +108,21 @@ class RendererV2(nn.Module):
 
 
 def make_renderer(cfg) -> nn.Module:
-    """cfg: None/() → v1 Renderer (16,24,32), (c1, c2, c3) → 폭을 바꾼 v1, (width, fdim, n_frames, dils) → RendererV2"""
+    """cfg: None/() → v1 Renderer (16,24,32), (c1, c2, c3[, fdim, n_frames]) → 폭을 바꾼 v1 (+ 프레임별 FiLM),
+    (width, fdim, n_frames, dils) → RendererV2"""
     if not cfg:
         return Renderer()
-    return Renderer(*cfg) if len(cfg) == 3 else RendererV2(*cfg)
+    return RendererV2(*cfg) if len(cfg) == 4 else Renderer(*cfg)
 
 
 def parse_rcfg(s: str | None, n_frames: int = 600):
-    """'24,32,40' → v1 폭 (24,32,40), '48,8' → RendererV2 (48,8,n,(1,1,2,4)), None → 기본 v1."""
+    """'24,32,40' → v1 폭, '24,32,40,8' → v1 폭 + 프레임별 FiLM 8차원, '48,8' → RendererV2 (48,8,n,(1,1,2,4)), None → 기본 v1."""
     if not s:
         return None
     v = tuple(int(x) for x in s.split(","))
-    return v if len(v) == 3 else (v[0], v[1], n_frames, (1, 1, 2, 4))
+    if len(v) == 3:
+        return v
+    return v + (n_frames,) if len(v) == 4 else (v[0], v[1], n_frames, (1, 1, 2, 4))
 
 
 def widen_renderer(old: Renderer, c1: int, c2: int, c3: int) -> Renderer:
@@ -133,7 +158,7 @@ def widen_renderer(old: Renderer, c1: int, c2: int, c3: int) -> Renderer:
 
 
 def render(G: nn.Module, seg: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    return G(seg, idx) if isinstance(G, RendererV2) else G(seg)
+    return G(seg, idx)
 
 
 # ---------------------------------------------------------------- 가중치 직렬화 (int8, 출력 채널별 스케일)
@@ -147,7 +172,7 @@ def pack_state(sd: dict, bits: int = 8) -> bytes:
     for k, v in sd.items():
         v = v.detach().float()
         if v.ndim >= 2:
-            s = (v.abs().reshape(v.shape[0], -1).amax(1).clamp_min(1e-8) / qmax).half().float()
+            s = (v.abs().reshape(v.shape[0], -1).amax(1).clamp_min(1e-8) / qmax).half().float().clamp_min(1e-8)  # 0 행 (fp16 에서 0) 대비
             q = (v / s.view(-1, *[1] * (v.ndim - 1))).round().clamp(-qmax, qmax).to(torch.int8)
             out.append(struct.pack("<B", 1) + s.half().numpy().tobytes() + q.numpy().tobytes())
         else:
@@ -181,7 +206,7 @@ def fake_quant_(module: nn.Module, bits: int) -> None:
     with torch.no_grad():
         for p in module.parameters():
             if p.ndim >= 2:
-                s = (p.abs().reshape(p.shape[0], -1).amax(1).clamp_min(1e-8) / qmax).half().float()
+                s = (p.abs().reshape(p.shape[0], -1).amax(1).clamp_min(1e-8) / qmax).half().float().clamp_min(1e-8)
                 p.copy_((p / s.view(-1, *[1] * (p.ndim - 1))).round().clamp(-qmax, qmax) * s.view(-1, *[1] * (p.ndim - 1)))
             else:
                 p.copy_(p.half().float())
