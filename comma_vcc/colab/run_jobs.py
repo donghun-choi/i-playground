@@ -69,64 +69,91 @@ def push(args, msg: str) -> None:
     print("push 실패 (결과는 로컬 results/ 에 남아 있다)", flush=True)
 
 
-def renderer_job(args, s: dict, track="renderer", bits=None, cycles=None, start: Path | None = None) -> None:
-    """flip 손실 + QAT 사이클을 반복. 사이클마다 600장 전체 평가, 가장 좋은 것을 이어서 학습한다.
-
-    track 'renderer' 는 --bits (4) 로 시드에서, 'renderer3' 은 3비트로 4비트 최고 렌더러에서 시작한다.
-    """
-    bits = bits or args.bits
-    cycles = cycles or args.cycles
-    tr = s.setdefault(track, {"widths": args.widths, "bits": bits, "cycles": []})
-    best_file = RES / f"{track}_best.pt"
-    if not best_file.exists():
-        shutil.copy(start or SEED / "renderer_seed.pt", best_file)
-        tr["best"] = {"cycle": 0, "disagreement": s.get("seed", {}).get("renderer_disagreement") if track == "renderer" else None}
-    for c in range(len(tr["cycles"]) + 1, cycles + 1):
-        t = time.time()
-        out = CACHE / f"gpu_{track}_c{c}.pt"
-        txt = run([sys.executable, "renderer.py", "--device", args.device, "--widths", args.widths, "--resume", str(best_file),
-                   "--epochs", str(args.epochs), "--lr", str(args.lr), "--bs", str(args.bs), "--cosine", "--fp32",
-                   "--bits", str(bits), "--qat", "--loss", "flip", "--full-eval", "--threads", "2", "--port", str(args.renderer_port),
-                   "--out", str(out), *args.limit], LOGS / f"{track}_c{c}.log")
-        d = float(re.findall(r"전체 600장 disagreement ([0-9.]+)", txt)[-1])
-        rec = {"cycle": c, "disagreement": d, "seg_term": 100 * d, "minutes": round((time.time() - t) / 60, 1)}
-        tr["cycles"].append(rec)
-        prev = tr.get("best", {}).get("disagreement")
-        if prev is None or d < prev:
-            shutil.copy(out, best_file)
-            tr["best"] = rec
-        save_summary(s)
-        print(f"== {track} 사이클 {c}: 600장 불일치 {d:.6f} (최고 {tr['best']['disagreement']}) {rec['minutes']}분", flush=True)
-        push(args, f"colab: {track} 사이클 {c} ({bits}비트) 불일치 {d:.6f}")
+RENDERER_TRACKS = ("renderer", "renderer3", "renderer_sc")
 
 
 def renderer_bytes(path: Path, widths: str, bits: int) -> int:
-    """archive 에 들어갈 렌더러 섹션 크기 (inflate 와 같은 포장)."""
+    """archive 에 들어갈 렌더러 섹션 크기 (inflate 와 같은 포장). bits 0 = self-compression (.q 바이트)."""
     sys.path[:0] = [str(VCC / "submissions" / "semantic_cpu")]
     import torch
     import archive
     from model import pack_state
 
     cfg = tuple(int(v) for v in widths.split(","))
+    if bits == 0:
+        return len(archive.pack_renderer(cfg, Path(str(path) + ".q").read_bytes()))
     return len(archive.pack_renderer(cfg, pack_state(torch.load(path, map_location="cpu"), bits)))
 
 
+def seg_plus_rate(d: float, nbytes: int) -> float:
+    return 100 * d + 25 * nbytes / 37_545_489
+
+
+def copy_renderer(src: Path, dst: Path) -> None:
+    """체크포인트와 함께 다니는 파일 (.q 바이트, .sc.pt 학습 상태) 까지 복사."""
+    shutil.copy(src, dst)
+    for ext in (".q", ".sc.pt"):
+        if Path(str(src) + ext).exists():
+            shutil.copy(str(src) + ext, str(dst) + ext)
+
+
+def renderer_job(args, s: dict, track="renderer", bits=None, cycles=None, start: Path | None = None) -> None:
+    """flip 손실 사이클을 반복. 사이클마다 600장 전체 평가, seg 항 + 렌더러 rate 가 가장 좋은 것을 이어서 학습한다.
+
+    renderer: --bits(4) QAT, 시드에서 / renderer3: 3비트 QAT, 4비트 최고에서 /
+    renderer_sc: self-compression (채널별 비트 학습, 시작 4비트), 4비트 최고에서. 저장 비트 0 = .q 바이트 사용.
+    """
+    bits = args.bits if bits is None else bits
+    cycles = cycles or args.cycles
+    sc = track == "renderer_sc"
+    tr = s.setdefault(track, {"widths": args.widths, "bits": 0 if sc else bits, "cycles": []})
+    best_file = RES / f"{track}_best.pt"
+    if not best_file.exists():
+        copy_renderer(start or SEED / "renderer_seed.pt", best_file)
+        seed_d = s.get("seed", {}).get("renderer_disagreement") if track == "renderer" else None
+        tr["best"] = {"cycle": 0, "disagreement": seed_d,
+                      "score": seg_plus_rate(seed_d, renderer_bytes(best_file, args.widths, bits)) if seed_d else None}
+    if tr.get("best", {}).get("score") is None and tr.get("best", {}).get("disagreement") is not None:  # 예전 요약 (score 없음)
+        tr["best"]["score"] = round(seg_plus_rate(tr["best"]["disagreement"], renderer_bytes(best_file, args.widths, tr["bits"])), 5)
+    for c in range(len(tr["cycles"]) + 1, cycles + 1):
+        t = time.time()
+        out = CACHE / f"gpu_{track}_c{c}.pt"
+        quant = ["--bits", "4", "--self-compress", str(args.sc_weight)] if sc else ["--bits", str(bits), "--qat"]
+        txt = run([sys.executable, "renderer.py", "--device", args.device, "--widths", args.widths, "--resume", str(best_file),
+                   "--epochs", str(args.epochs), "--lr", str(args.lr), "--bs", str(args.bs), "--cosine", "--fp32", *quant,
+                   "--loss", "flip", "--full-eval", "--threads", "2", "--port", str(args.renderer_port),
+                   "--out", str(out), *args.limit], LOGS / f"{track}_c{c}.log")
+        d = float(re.findall(r"전체 600장 disagreement ([0-9.]+)", txt)[-1])
+        nb = renderer_bytes(out, args.widths, tr["bits"])
+        rec = {"cycle": c, "disagreement": d, "seg_term": 100 * d, "bytes": nb, "score": round(seg_plus_rate(d, nb), 5),
+               "minutes": round((time.time() - t) / 60, 1)}
+        tr["cycles"].append(rec)
+        prev = tr.get("best", {}).get("score")
+        if prev is None or rec["score"] < prev:
+            copy_renderer(out, best_file)
+            tr["best"] = rec
+        save_summary(s)
+        print(f"== {track} 사이클 {c}: 600장 불일치 {d:.6f}, {nb:,} B → seg+rate {rec['score']:.4f} (최고 {tr['best'].get('score')}) {rec['minutes']}분", flush=True)
+        push(args, f"colab: {track} 사이클 {c} 불일치 {d:.6f} {nb} B")
+
+
 def pick_renderer(args, s: dict):
-    """seg 항 + 렌더러 rate 항이 가장 작은 렌더러 (4비트 / 3비트 트랙)."""
+    """seg 항 + 렌더러 rate 항이 가장 작은 렌더러 (트랙별 최고 중에서)."""
     cands = []
-    for track in ("renderer", "renderer3"):
+    for track in RENDERER_TRACKS:
         f = RES / f"{track}_best.pt"
         tr = s.get(track, {})
         d = tr.get("best", {}).get("disagreement")
         if f.exists() and d is not None:
             nb = renderer_bytes(f, args.widths, tr["bits"])
-            cands.append((100 * d + 25 * nb / 37_545_489, f, tr["bits"], d, nb))
+            cands.append((seg_plus_rate(d, nb), f, tr["bits"], d, nb))
     if not cands:
         return SEED / "renderer_seed.pt", args.bits
     cands.sort(key=lambda x: x[0])
-    for sc, f, b, d, nb in cands:
-        print(f"후보 {f.name}: {b}비트, 불일치 {d:.6f}, {nb:,} B → seg+렌더러 rate {sc:.4f}", flush=True)
-    s["renderer_choice"] = {"file": cands[0][1].name, "bits": cands[0][2], "disagreement": cands[0][3], "bytes": cands[0][4], "seg_plus_rate": round(cands[0][0], 5)}
+    for sc_, f, b, d, nb in cands:
+        print(f"후보 {f.name}: {b or '채널별'}비트, 불일치 {d:.6f}, {nb:,} B → seg+렌더러 rate {sc_:.4f}", flush=True)
+    s["renderer_choice"] = {"file": cands[0][1].name, "bits": cands[0][2], "disagreement": cands[0][3], "bytes": cands[0][4],
+                            "seg_plus_rate": round(cands[0][0], 5)}
     return cands[0][1], cands[0][2]
 
 
@@ -194,6 +221,8 @@ def main():
     ap.add_argument("--pose-bbits", type=int, default=5, help="pose 기저 B 저장 비트 (6 미만이면 기저 QAT)")
     ap.add_argument("--pose-variants", default="24x32,12x16", help="기저 해상도 변형 (쉼표로)")
     ap.add_argument("--r3-cycles", type=int, default=4, help="3비트 렌더러 트랙 사이클 수")
+    ap.add_argument("--sc-cycles", type=int, default=4, help="self-compression 렌더러 트랙 사이클 수")
+    ap.add_argument("--sc-weight", type=float, default=1.0, help="self-compression 크기 손실 배율 (1 = 점수 공식 기준)")
     ap.add_argument("--push", action="store_true", help="결과를 colab-results 브랜치로 push")
     ap.add_argument("--renderer-port", type=int, default=8020, help="렌더러 학습 livevis 포트")
     ap.add_argument("--pose-port", type=int, default=8014, help="pose 피팅 livevis 포트")
@@ -204,7 +233,7 @@ def main():
         global RES, LOGS, SUMMARY
         RES = HERE / "results_smoke"
         LOGS, SUMMARY = RES / "logs", RES / "summary.json"
-        args.epochs, args.cycles, args.pose_epochs, args.r3_cycles = 1, 2, 2, 1
+        args.epochs, args.cycles, args.pose_epochs, args.r3_cycles, args.sc_cycles = 1, 2, 2, 1, 1
         args.plain_epochs, args.polish_epochs, args.q_epochs, args.limit = 1, 1, 1, ["--limit", "8"]
 
     RES.mkdir(parents=True, exist_ok=True)
@@ -216,6 +245,8 @@ def main():
         renderer_job(args, s)
     if "renderer3" in jobs:
         renderer_job(args, s, track="renderer3", bits=3, cycles=args.r3_cycles, start=RES / "renderer_best.pt")
+    if "renderer_sc" in jobs:
+        renderer_job(args, s, track="renderer_sc", bits=4, cycles=args.sc_cycles, start=RES / "renderer_best.pt")
     if "pose" in jobs:
         pose_job(args, s)
     print("\n모든 작업 끝:", json.dumps(s, indent=2, ensure_ascii=False))

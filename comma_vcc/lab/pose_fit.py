@@ -25,7 +25,8 @@ def renders(renderer_path, cfg, seg, pre, bits=8, bs=8, device="cpu"):
     """inflate 와 같은 홀수 프레임과 '이전 프레임' 들."""
     G = make_renderer(cfg)
     G.load_state_dict(torch.load(renderer_path, map_location="cpu"))
-    quantize_roundtrip(G, bits)
+    if bits:  # 0 = 이미 양자화된 가중치 (self-compression export)
+        quantize_roundtrip(G, bits)
     G.eval().to(device)
     n = len(seg)
     odd = torch.zeros(n, 3, SH, SW, device=device)

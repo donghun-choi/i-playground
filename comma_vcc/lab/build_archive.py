@@ -43,7 +43,7 @@ def main():
     ap.add_argument("--out", default=str(SUB / "archive.zip"))
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--renderer-cfg", default=None, help="렌더러 구성: v1 폭 'c1,c2,c3' 또는 RendererV2 'width,fdim'")
-    ap.add_argument("--rbits", type=int, default=8, help="렌더러 저장 비트 수 (pose_fit 과 같게)")
+    ap.add_argument("--rbits", type=int, default=8, help="렌더러 저장 비트 수 (pose_fit 과 같게). 0 = self-compression (renderer + '.q' 바이트)")
     ap.add_argument("--cbits", type=int, default=8, help="문맥 모델 가중치 비트 수")
     ap.add_argument("--segs-only", action="store_true", help="seg 스트림만 인코드해서 캐시에 저장")
     ap.add_argument("--no-verify", action="store_true", help="seg 디코드 왕복 확인 생략")
@@ -66,7 +66,10 @@ def main():
         return
     print(f"seg 스트림 {len(segs):,} B ({len(segs) / len(seg):.0f} B/frame), 문맥모델 {len(ctxn):,} B ({time.time() - t:.0f}s)", flush=True)
     cfg = parse_rcfg(args.renderer_cfg, len(seg))
-    rend = archive.pack_renderer(cfg, pack_state(torch.load(args.renderer), args.rbits))
+    if args.rbits == 0:  # self-compression: 학습 때 만든 바이트 (채널별 비트) 그대로
+        rend = archive.pack_renderer(cfg, open(args.renderer + ".q", "rb").read())
+    else:
+        rend = archive.pack_renderer(cfg, pack_state(torch.load(args.renderer), args.rbits))
     if args.pose2:
         pose_sec = ("pos3", archive.pose2_to_pose3(open(args.pose2, "rb").read()))
     else:
