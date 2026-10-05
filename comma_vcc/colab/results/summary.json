@@ -33,12 +33,18 @@
         "disagreement": 0.000305,
         "seg_term": 0.0305,
         "minutes": 9.7
+      },
+      {
+        "cycle": 5,
+        "disagreement": 0.000291,
+        "seg_term": 0.0291,
+        "minutes": 9.7
       }
     ],
     "best": {
-      "cycle": 4,
-      "disagreement": 0.000305,
-      "seg_term": 0.0305,
+      "cycle": 5,
+      "disagreement": 0.000291,
+      "seg_term": 0.0291,
       "minutes": 9.7
     }
   }
