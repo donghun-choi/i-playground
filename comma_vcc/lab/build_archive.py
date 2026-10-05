@@ -30,7 +30,8 @@ def build_qnet(ckpt: str, seg, wbits: int = 8) -> sc.QNet:
     _, sd, dils = load_ctx(ckpt)
     calib = [sc.build_input_q(seg[t : t + 1], seg[t - 1 : t], seg[t - 2 : t - 1], s, k)
              for t in (50, 200, 350, 500) for s in sc.LEVELS for k in "AB"]
-    return sc.quantize_ctxnet(sd, calib, wbits=wbits, dils=dils)
+    wq = torch.load(ckpt).get("wq")  # self-compression 학습 결과 (채널별 비트) 면 그 양자화를 그대로
+    return sc.quantize_ctxnet(sd, calib, wbits=wbits, dils=dils, wq=wq)
 
 
 def main():
