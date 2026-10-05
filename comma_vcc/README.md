@@ -35,10 +35,10 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v4b, 점수 0.3207)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v5a, 점수 0.2810)
 
 ```
-archive (224KB) = 정수 문맥 CNN (17KB) + seg 맵 601장 무손실 스트림 (124KB) + 렌더러 (50KB, 폭 24·32·40) + pose (32KB)
+archive (221KB) = 정수 문맥 CNN (17KB) + seg 맵 601장 무손실 스트림 (124KB) + 렌더러 (50KB, 폭 24·32·40) + pose (30KB, 계수는 Rice 부호)
 
 seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본 짝수 프레임 0 의 맵 1장)
 홀수 프레임 i   = 렌더러(M_i)                                         → SegNet 이 M_i 를 내도록 학습
@@ -60,7 +60,7 @@ seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본
 | `lab/build_archive.py` | 정수화 + 인코드 + archive.zip 조립 |
 | 나머지 `lab/*_exp.py`, `analyze.py`, `seg_errors.py`, `bits_breakdown.py` | 실험/분석 |
 
-### v4b 재현 (CPU 4코어, 대략 15시간)
+### v5a 재현 (CPU 4코어, 대략 17시간)
 ```bash
 cd comma_vcc/lab
 ../.venv/bin/python build_cache.py                                                   # 3분
@@ -78,7 +78,10 @@ cd comma_vcc/lab
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v1ft2.bin --renderer ../cache/renderer_w243240ft.pt --renderer-cfg 24,32,40 --cbits 10 --epochs 100 --lr 0.02 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_w24.bin
 # v4b: 회전 차원을 위해 공유 기저 B 도 차원 가중 손실로 다시 학습한 뒤, B 고정 일반 MSE 로 전진 차원을 회복
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_w24.bin --renderer ../cache/renderer_w243240ft.pt --renderer-cfg 24,32,40 --cbits 10 --epochs 40 --lr 0.002 --train-b 0.02 --dimw 0.5 --plain-epochs 20 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_w24b.bin
-../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24d2.pt --cbits 6 --renderer ../cache/renderer_w243240ft.pt --renderer-cfg 24,32,40 --rbits 6 --pose2 ../cache/pose2_w24b.bin
+# v5a: 완전 정규화 손실(1/분산) + 높은 학습률 + B 학습 150에폭 → B 6비트 고정 일반 MSE 30에폭 (78분, 10에폭마다 체크포인트 --resume)
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_w24b.bin --renderer ../cache/renderer_w243240ft.pt --renderer-cfg 24,32,40 --cbits 10 --epochs 150 --lr 0.01 --train-b 0.02 --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_w24c.bin
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_w24c.bin --renderer ../cache/renderer_w243240ft.pt --renderer-cfg 24,32,40 --cbits 10 --epochs 40 --lr 0.002 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_w24d.bin
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24d2.pt --cbits 6 --renderer ../cache/renderer_w243240ft.pt --renderer-cfg 24,32,40 --rbits 6 --pose2 ../cache/pose2_w24d.bin
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -124,6 +127,13 @@ cd .. && bash run.sh semantic_cpu
   그래서 Jacobian 방향 보정(J^T a) 도 거대한 스텝이 필요해 발산.
 - 짝수 프레임을 **이전 쌍의 렌더 프레임**으로 두면 PoseNet 이 자연스러운 운동 상태(전진 ≈ 33)에 들어가고, 거기서는 아핀 변형이 회전 차원도 움직인다.
   64쌍 400 step: 회색 carrier 0.0064 → 홀수+이동 0.00049 → **이전 렌더 + 아핀 + carrier 0.000249**.
+- (v5a) v4b 의 차원별 잔차 RMS / 표준편차 = [0.002, 0.70, 0.77, 0.90, 0.86, 0.61] — 전진만 맞고 나머지는 사실상 평균을 내고 있었다.
+  24쌍 진단 (`lab/pose_diag.py`, 300 step): 쌍마다 자유 48x64 이미지 8.7e-5, 지금 구조 + B 학습 1.8e-5, 지금 구조 + B 고정은 2.6e-3 (발산).
+  → 쌍별 계수만으로는 회전 차원을 못 움직이고 공유 기저가 같이 적응해야 한다.
+  600쌍에서 손실을 완전 정규화(1/분산, dimw 1.0)하고 학습률을 5배(0.01) 올려 150에폭 돌리니 1~5차원 RMS 가 1/5~1/10 로 줄었다
+  (전진 차원은 가중치가 1e-4 라 0.04 까지 흐트러지지만 B 고정 일반 MSE 단계에서 회복). 결과 posenet 2.6e-4 → **1.6e-5** (항 0.051 → 0.013).
+  일반 MSE 단계를 높은 학습률로 시작하면 전진 차원이 한 번 크게 튀므로 마지막 다듬기는 낮은 학습률(0.002)이 낫다.
+- pose 계수는 시간 상관이 없다 (차분 분산이 값 분산의 2배) → 차분 + xz 대신 (값 - 평균) 을 Rice 부호로: 14.7KB → 12.4KB (`pos3` 섹션).
 
 ### v2 에서 바꾼 것과 근거
 | 항목 | v1 | v2 | 근거 |
@@ -134,7 +144,7 @@ cd .. && bash run.sh semantic_cpu
 | pose | 회색 + 학습 기저 | **이전 쌍 렌더 + 쌍별 아핀 + 학습 기저** (기저 6비트) | 회전 차원 제어 |
 | 첫 쌍 | - | GT 짝수 프레임 0 의 seg 맵 1장을 seg 스트림 앞에 추가 | 첫 쌍은 '이전 프레임' 이 없다 |
 
-시도했지만 버린 것: 경계 사전보정 (불일치 -12% 에 프레임당 284픽셀 변경), inflate 시점 SegNet 그래디언트 보정 (3스텝 -27%, 600장에 스텝당 2.6분이라 시간 제한 위험),
+시도했지만 버린 것: 경계 사전보정 (불일치 -12% 에 프레임당 284픽셀 변경), inflate 시점 SegNet 그래디언트 보정 (3스텝 -27%, 600장에 스텝당 2.6분이라 시간 제한 위험), 움직임 보상 문맥 (전역 확대 와핑으로 이전 맵 예측 불일치 1.23% → 1.20% 뿐), 손실 seg 맵 단순화 (10bit 넘는 픽셀이 프레임당 2.7개, 이득 ~0.5KB),
 노면 평면 움직임 보상 (바뀐 픽셀 22% 맞히고 15% 새로 틀림), 기저 24개 (-11% 에 저장 2배).
 
 pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 차원이 그대로였다 (0.0317 → 0.0308).
@@ -158,3 +168,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v3 | 0.00144 | 0.00037 | 0.00543 | **0.3403** | 렌더러 fp32 미세조정, 문맥모델 추가 학습(193 B/frame), pose 재다듬기(계수 10비트). inflate 334s + 평가 231s |
 | semantic_cpu v4 | 0.00121 | 0.00036 | 0.00595 | **0.3298** | 렌더러 폭 16·24·32 → 24·32·40 (함수 보존 확장 + bf16 10에폭 + fp32 6에폭, 6비트 49.8KB), pose 재다듬기. inflate 378s + 평가 242s |
 | semantic_cpu v4b | 0.00121 | 0.00026 | 0.00595 | **0.3207** | v4 + pose 기저 B 재학습 (차원 가중 0.5 + B 학습 40에폭 → B 고정 일반 MSE 20에폭). inflate 311s + 평가 197s |
+| semantic_cpu v5a | 0.00121 | 0.0000162 | 0.00590 | **0.2810** | pose: 완전 정규화 손실 + B 학습 150에폭 → 일반 MSE 다듬기 (회전/좌우 차원을 처음으로 맞춤), pose 계수 Rice 부호 (-2.2KB). inflate 392s + 평가 238s |
