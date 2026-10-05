@@ -62,6 +62,18 @@ def load_ctx(path):
     return m, sd, dils
 
 
+def fq_weights(model, bits: int) -> dict:
+    """conv 가중치를 bits 비트 격자로 (출력 채널별 max/qmax, segcodec.quantize_ctxnet 과 같은 규칙), STE."""
+    qmax = 2 ** (bits - 1) - 1
+    out = {}
+    for k, p in model.named_parameters():
+        if k.endswith(".weight"):
+            sc_ = p.detach().abs().amax((1, 2, 3), keepdim=True).clamp_min(1e-8) / qmax
+            p = p + ((p / sc_).round().clamp(-qmax, qmax) * sc_ - p).detach()
+        out[k] = p
+    return out
+
+
 def frame_maps(seg, t):
     return seg[t : t + 1], (seg[t - 1 : t] if t >= 1 else None), (seg[t - 2 : t - 1] if t >= 2 else None)
 
@@ -94,6 +106,7 @@ def main():
     ap.add_argument("--out", default=str(CACHE / "ctxnet.pt"))
     ap.add_argument("--init", default=None)
     ap.add_argument("--dils", default=None, help="층별 dilation, 예: 1,2,4,2,1")
+    ap.add_argument("--qat-bits", type=int, default=0, help="> 0 이면 가중치를 이 비트 격자로 가짜 양자화해서 학습 (quantize_ctxnet 과 같은 출력 채널별 스케일)")
     args = ap.parse_args()
 
     from livevis import LiveVis
@@ -136,7 +149,7 @@ def main():
         x = torch.cat(xs)
         tmask = torch.cat(tg)
         g = torch.cat(gs)
-        logits = model(x)
+        logits = torch.func.functional_call(model, fq_weights(model, args.qat_bits), (x,)) if args.qat_bits else model(x)
         nll = F.cross_entropy(logits, g, reduction="none")[tmask]
         loss = nll.mean()
         opt.zero_grad()
