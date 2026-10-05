@@ -130,29 +130,54 @@ def pick_renderer(args, s: dict):
     return cands[0][1], cands[0][2]
 
 
+def pose_bytes(path: Path) -> int:
+    """archive 에 들어갈 pose 섹션 (pos3) 크기."""
+    sys.path[:0] = [str(VCC / "submissions" / "semantic_cpu")]
+    import archive
+
+    return len(archive.pose2_to_pose3(path.read_bytes()))
+
+
 def pose_job(args, s: dict) -> None:
-    """최고 렌더러에 맞춰 pose 재피팅: 정규화 손실 + 기저 학습 → 일반 MSE → 낮은 학습률 다듬기."""
+    """고른 렌더러에 맞춰 pose 재피팅 (기저 해상도 변형마다): 정규화 손실 + 기저 학습 → 일반 MSE → 낮은 학습률 다듬기.
+
+    변형 중 pose 항 + pose 섹션 rate 가 가장 작은 것을 pose2_best.bin 으로.
+    """
     renderer, rbits = pick_renderer(args, s)
     start = SEED / "pose2_seed.bin"
     common = ["--device", args.device, "--renderer", str(renderer), "--renderer-cfg", args.widths, "--rbits", str(rbits),
               "--cbits", "10", "--q-epochs", str(args.q_epochs), "--greedy-rounds", "1", "--threads", "2", "--port", str(args.pose_port), *args.limit]
-    main_out, pol_out = CACHE / "gpu_pose_main.bin", CACHE / "gpu_pose_pol.bin"
-    t = time.time()
-    txt1 = run([sys.executable, "pose_refine.py", "--pose2", str(start), *common, "--epochs", str(args.pose_epochs), "--lr", "0.01",
-                "--train-b", "0.02", "--dimw", "1.0", "--plain-epochs", str(args.plain_epochs), "--bbits", str(args.pose_bbits),
-                *(["--b-qat"] if args.pose_bbits < 6 else []), "--out", str(main_out)], LOGS / "pose_main.log")
-    txt2 = run([sys.executable, "pose_refine.py", "--pose2", str(main_out), *common, "--epochs", str(args.polish_epochs), "--lr", "0.001",
-                "--out", str(pol_out)], LOGS / "pose_polish.log")
     found = re.compile(r"평가 경로 posenet_dist ([0-9.]+)")
-    d1, d2 = float(found.findall(txt1)[-1]), float(found.findall(txt2)[-1])
-    best, d = (pol_out, d2) if d2 <= d1 else (main_out, d1)
-    shutil.copy(best, RES / "pose2_best.bin")
-    s["pose"] = {"renderer": renderer.name, "rbits": rbits, "bbits": args.pose_bbits,
-                 "posenet_main": d1, "posenet_polish": d2, "posenet_best": d, "pose_term": round((10 * d) ** 0.5, 5),
-                 "minutes": round((time.time() - t) / 60, 1)}
-    save_summary(s)
-    print(f"== pose: 평가 경로 posenet {d:.7f} (항 {(10 * d) ** 0.5:.4f})", flush=True)
-    push(args, f"colab: pose 재피팅 posenet {d:.7f}")
+    ps = s.setdefault("pose", {})
+    if ps.get("renderer") != renderer.name or ps.get("rbits") != rbits:  # 렌더러가 바뀌면 처음부터
+        ps.clear()
+        ps.update({"renderer": renderer.name, "rbits": rbits, "variants": {}})
+    variants = ps.setdefault("variants", {})
+    for res in [v.strip() for v in args.pose_variants.split(",") if v.strip()]:
+        key = f"{res}_b{args.pose_bbits}"
+        if key in variants:
+            continue
+        t = time.time()
+        bres = [] if res == "24x32" else ["--b-res", res.replace("x", ",")]
+        main_out, pol_out = CACHE / f"gpu_pose_{key}_main.bin", CACHE / f"gpu_pose_{key}_pol.bin"
+        txt1 = run([sys.executable, "pose_refine.py", "--pose2", str(start), *common, "--epochs", str(args.pose_epochs), "--lr", "0.01",
+                    "--train-b", "0.02", "--dimw", "1.0", "--plain-epochs", str(args.plain_epochs), "--bbits", str(args.pose_bbits),
+                    *(["--b-qat"] if args.pose_bbits < 6 else []), *bres, "--out", str(main_out)], LOGS / f"pose_{key}_main.log")
+        txt2 = run([sys.executable, "pose_refine.py", "--pose2", str(main_out), *common, "--epochs", str(args.polish_epochs), "--lr", "0.001",
+                    "--out", str(pol_out)], LOGS / f"pose_{key}_polish.log")
+        d1, d2 = float(found.findall(txt1)[-1]), float(found.findall(txt2)[-1])
+        best, d = (pol_out, d2) if d2 <= d1 else (main_out, d1)
+        shutil.copy(best, RES / f"pose2_{key}.bin")
+        nb = pose_bytes(best)
+        sc = (10 * d) ** 0.5 + 25 * nb / 37_545_489
+        variants[key] = {"posenet": d, "pose_term": round((10 * d) ** 0.5, 5), "bytes": nb, "pose_plus_rate": round(sc, 5),
+                         "minutes": round((time.time() - t) / 60, 1)}
+        bk = min(variants, key=lambda k: variants[k]["pose_plus_rate"])
+        shutil.copy(RES / f"pose2_{bk}.bin", RES / "pose2_best.bin")
+        ps["best"] = bk
+        save_summary(s)
+        print(f"== pose {key}: posenet {d:.7f} (항 {(10 * d) ** 0.5:.4f}), {nb:,} B → pose+rate {sc:.4f} (최고 {bk})", flush=True)
+        push(args, f"colab: pose {key} posenet {d:.7f} {nb} B")
 
 
 def main():
@@ -167,6 +192,7 @@ def main():
     ap.add_argument("--bs", type=int, default=4)
     ap.add_argument("--pose-epochs", type=int, default=200)
     ap.add_argument("--pose-bbits", type=int, default=5, help="pose 기저 B 저장 비트 (6 미만이면 기저 QAT)")
+    ap.add_argument("--pose-variants", default="24x32,12x16", help="기저 해상도 변형 (쉼표로)")
     ap.add_argument("--r3-cycles", type=int, default=4, help="3비트 렌더러 트랙 사이클 수")
     ap.add_argument("--push", action="store_true", help="결과를 colab-results 브랜치로 push")
     ap.add_argument("--renderer-port", type=int, default=8020, help="렌더러 학습 livevis 포트")

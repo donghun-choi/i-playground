@@ -13,6 +13,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from common import CACHE, SH, SW, downsample, load_gt, nets, pose_out, setup_device
 import archive  # noqa: E402
@@ -38,6 +39,7 @@ def main():
     ap.add_argument("--port", type=int, default=8014)
     ap.add_argument("--train-b", type=float, default=0.0, help="> 0 이면 기저 B 도 이 학습률로 함께 학습 (렌더러가 바뀌어 회전 차원이 나빠졌을 때)")
     ap.add_argument("--bbits", type=int, default=6)
+    ap.add_argument("--b-res", default=None, help="기저 B 해상도를 바꿔서 시작 (예: 12,16). --train-b 필요")
     ap.add_argument("--b-qat", action="store_true", help="기저 학습 때 B 를 --bbits 격자로 가짜 양자화 (STE) → 저비트 기저에 적응")
     ap.add_argument("--plain-epochs", type=int, default=0, help="본 학습(가중/B 학습) 뒤 B 고정 + 일반 MSE 로 더 학습할 에폭")
     ap.add_argument("--dimw", type=float, default=0.0, help="본 학습 손실의 차원별 가중 (1/분산)^dimw (양자화 단계는 일반 MSE)")
@@ -64,6 +66,11 @@ def main():
     blob = open(args.pose2, "rb").read()
     pos = archive.unpack_pose2(blob)
     B = pos["B"].clone().to(dev)
+    if args.b_res:
+        assert args.train_b > 0, "--b-res 는 기저를 다시 학습해야 한다 (--train-b)"
+        bh, bw = (int(v) for v in args.b_res.split(","))
+        B = F.interpolate(B, size=(bh, bw), mode="area" if bh <= B.shape[2] else "bicubic")
+        print(f"기저 해상도 {tuple(pos['B'].shape[2:])} → {(bh, bw)}", flush=True)
     opt_B = None
     if args.train_b > 0:
         B.requires_grad_(True)
