@@ -173,7 +173,7 @@ def pose_job(args, s: dict) -> None:
     renderer, rbits = pick_renderer(args, s)
     start = SEED / "pose2_seed.bin"
     common = ["--device", args.device, "--renderer", str(renderer), "--renderer-cfg", args.widths, "--rbits", str(rbits),
-              "--cbits", "10", "--q-epochs", str(args.q_epochs), "--greedy-rounds", "1", "--threads", "2", "--port", str(args.pose_port), *args.limit]
+              "--cbits", str(args.pose_cbits), "--q-epochs", str(args.q_epochs), "--greedy-rounds", "1", "--threads", "2", "--port", str(args.pose_port), *args.limit]
     found = re.compile(r"평가 경로 posenet_dist ([0-9.]+)")
     ps = s.setdefault("pose", {})
     if ps.get("renderer") != renderer.name or ps.get("rbits") != rbits:  # 렌더러가 바뀌면 처음부터
@@ -220,6 +220,7 @@ def main():
     ap.add_argument("--pose-epochs", type=int, default=200)
     ap.add_argument("--pose-bbits", type=int, default=5, help="pose 기저 B 저장 비트 (6 미만이면 기저 QAT)")
     ap.add_argument("--pose-variants", default="24x32,12x16", help="기저 해상도 변형 (쉼표로)")
+    ap.add_argument("--pose-cbits", type=int, default=9, help="pose 계수 격자 비트 (9 는 10 과 같은 pose 항에 -1.35KB)")
     ap.add_argument("--r3-cycles", type=int, default=4, help="3비트 렌더러 트랙 사이클 수")
     ap.add_argument("--sc-cycles", type=int, default=4, help="self-compression 렌더러 트랙 사이클 수")
     ap.add_argument("--sc-weight", type=float, default=1.0, help="self-compression 크기 손실 배율 (1 = 점수 공식 기준)")
