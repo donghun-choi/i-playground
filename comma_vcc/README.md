@@ -35,10 +35,10 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v5a, 점수 0.2810)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v5b, 점수 0.2128)
 
 ```
-archive (221KB) = 정수 문맥 CNN (17KB) + seg 맵 601장 무손실 스트림 (124KB) + 렌더러 (50KB, 폭 24·32·40) + pose (30KB, 계수는 Rice 부호)
+archive (212KB) = 정수 문맥 CNN (17KB) + seg 맵 601장 무손실 스트림 (124KB) + 렌더러 (40KB, 폭 24·32·40, 5비트) + pose (30KB, 계수는 Rice 부호)
 
 seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본 짝수 프레임 0 의 맵 1장)
 홀수 프레임 i   = 렌더러(M_i)                                         → SegNet 이 M_i 를 내도록 학습
@@ -60,7 +60,7 @@ seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본
 | `lab/build_archive.py` | 정수화 + 인코드 + archive.zip 조립 |
 | 나머지 `lab/*_exp.py`, `analyze.py`, `seg_errors.py`, `bits_breakdown.py` | 실험/분석 |
 
-### v5a 재현 (CPU 4코어, 대략 17시간)
+### v5b 재현 (CPU 4코어, 대략 20시간)
 ```bash
 cd comma_vcc/lab
 ../.venv/bin/python build_cache.py                                                   # 3분
@@ -81,7 +81,12 @@ cd comma_vcc/lab
 # v5a: 완전 정규화 손실(1/분산) + 높은 학습률 + B 학습 150에폭 → B 6비트 고정 일반 MSE 30에폭 (78분, 10에폭마다 체크포인트 --resume)
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_w24b.bin --renderer ../cache/renderer_w243240ft.pt --renderer-cfg 24,32,40 --cbits 10 --epochs 150 --lr 0.01 --train-b 0.02 --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_w24c.bin
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_w24c.bin --renderer ../cache/renderer_w243240ft.pt --renderer-cfg 24,32,40 --cbits 10 --epochs 40 --lr 0.002 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_w24d.bin
-../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24d2.pt --cbits 6 --renderer ../cache/renderer_w243240ft.pt --renderer-cfg 24,32,40 --rbits 6 --pose2 ../cache/pose2_w24d.bin
+# (여기까지가 v5a) v5b: 렌더러를 'argmax 가 뒤집힐 확률' 손실 + 양자화 인지 학습(QAT) 으로 다듬고 pose 를 다시 맞춘다
+../.venv/bin/python renderer.py --widths 24,32,40 --resume ../cache/renderer_w243240ft.pt --epochs 6 --lr 4e-4 --cosine --fp32 --bits 6 --qat --loss flip --full-eval --out ../cache/renderer_w24flip.pt
+../.venv/bin/python renderer.py --widths 24,32,40 --resume ../cache/renderer_w24flip.pt --epochs 6 --lr 4e-4 --cosine --fp32 --bits 5 --qat --loss flip --full-eval --out ../cache/renderer_w24flip5.pt
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_w24d.bin --renderer ../cache/renderer_w24flip5.pt --renderer-cfg 24,32,40 --rbits 5 --cbits 10 --epochs 60 --lr 0.005 --train-b 0.01 --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_v5b.bin
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v5b.bin --renderer ../cache/renderer_w24flip5.pt --renderer-cfg 24,32,40 --rbits 5 --cbits 10 --epochs 30 --lr 0.001 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_v5b2.bin
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24d2.pt --cbits 6 --renderer ../cache/renderer_w24flip5.pt --renderer-cfg 24,32,40 --rbits 5 --pose2 ../cache/pose2_v5b2.bin
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -133,6 +138,10 @@ cd .. && bash run.sh semantic_cpu
   600쌍에서 손실을 완전 정규화(1/분산, dimw 1.0)하고 학습률을 5배(0.01) 올려 150에폭 돌리니 1~5차원 RMS 가 1/5~1/10 로 줄었다
   (전진 차원은 가중치가 1e-4 라 0.04 까지 흐트러지지만 B 고정 일반 MSE 단계에서 회복). 결과 posenet 2.6e-4 → **1.6e-5** (항 0.051 → 0.013).
   일반 MSE 단계를 높은 학습률로 시작하면 전진 차원이 한 번 크게 튀므로 마지막 다듬기는 낮은 학습률(0.002)이 낫다.
+- (v5b) 렌더러 손실을 바꾼 것이 가장 컸다. CE + margin 2 hinge 는 이미 맞는 픽셀에도 힘을 쓰는데, 앞 절반 softplus(-margin/0.2)·0.2,
+  뒤 절반 sigmoid(-margin/τ) (τ 0.15→0.05, '뒤집힐 확률' 의 매끈한 근사) 로 바꾸니 같은 렌더러가 6에폭 만에 불일치 0.00121 → 0.00060.
+  그대로 5비트 QAT (STE 가짜 양자화, inflate 와 같은 격자) 로 6에폭 더 → 0.000506 이면서 렌더러 49.8KB → 40.2KB.
+  렌더러가 바뀌면 이전 렌더 기반 짝수 프레임도 바뀌어 pose 를 다시 맞춰야 한다 (60에폭으로는 v5a 수준까지 못 감: 1.6e-5 → 4.5e-5).
 - pose 계수는 시간 상관이 없다 (차분 분산이 값 분산의 2배) → 차분 + xz 대신 (값 - 평균) 을 Rice 부호로: 14.7KB → 12.4KB (`pos3` 섹션).
 
 ### v2 에서 바꾼 것과 근거
@@ -168,4 +177,5 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v3 | 0.00144 | 0.00037 | 0.00543 | **0.3403** | 렌더러 fp32 미세조정, 문맥모델 추가 학습(193 B/frame), pose 재다듬기(계수 10비트). inflate 334s + 평가 231s |
 | semantic_cpu v4 | 0.00121 | 0.00036 | 0.00595 | **0.3298** | 렌더러 폭 16·24·32 → 24·32·40 (함수 보존 확장 + bf16 10에폭 + fp32 6에폭, 6비트 49.8KB), pose 재다듬기. inflate 378s + 평가 242s |
 | semantic_cpu v4b | 0.00121 | 0.00026 | 0.00595 | **0.3207** | v4 + pose 기저 B 재학습 (차원 가중 0.5 + B 학습 40에폭 → B 고정 일반 MSE 20에폭). inflate 311s + 평가 197s |
+| semantic_cpu v5b | 0.000506 | 0.0000453 | 0.00564 | **0.2128** | 렌더러 flip 손실(뒤집힐 확률) + 5비트 QAT (seg 항 0.121 → 0.051, 렌더러 -9.6KB), pose 재피팅. inflate 371s + 평가 226s |
 | semantic_cpu v5a | 0.00121 | 0.0000162 | 0.00590 | **0.2810** | pose: 완전 정규화 손실 + B 학습 150에폭 → 일반 MSE 다듬기 (회전/좌우 차원을 처음으로 맞춤), pose 계수 Rice 부호 (-2.2KB). inflate 392s + 평가 238s |
