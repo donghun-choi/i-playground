@@ -69,20 +69,25 @@ def push(args, msg: str) -> None:
     print("push 실패 (결과는 로컬 results/ 에 남아 있다)", flush=True)
 
 
-def renderer_job(args, s: dict) -> None:
-    """flip 손실 + QAT 사이클을 반복. 사이클마다 600장 전체 평가, 가장 좋은 것을 이어서 학습한다."""
-    tr = s.setdefault("renderer", {"widths": args.widths, "bits": args.bits, "cycles": []})
-    best_file = RES / "renderer_best.pt"
+def renderer_job(args, s: dict, track="renderer", bits=None, cycles=None, start: Path | None = None) -> None:
+    """flip 손실 + QAT 사이클을 반복. 사이클마다 600장 전체 평가, 가장 좋은 것을 이어서 학습한다.
+
+    track 'renderer' 는 --bits (4) 로 시드에서, 'renderer3' 은 3비트로 4비트 최고 렌더러에서 시작한다.
+    """
+    bits = bits or args.bits
+    cycles = cycles or args.cycles
+    tr = s.setdefault(track, {"widths": args.widths, "bits": bits, "cycles": []})
+    best_file = RES / f"{track}_best.pt"
     if not best_file.exists():
-        shutil.copy(SEED / "renderer_seed.pt", best_file)
-        tr["best"] = {"cycle": 0, "disagreement": s.get("seed", {}).get("renderer_disagreement")}
-    for c in range(len(tr["cycles"]) + 1, args.cycles + 1):
+        shutil.copy(start or SEED / "renderer_seed.pt", best_file)
+        tr["best"] = {"cycle": 0, "disagreement": s.get("seed", {}).get("renderer_disagreement") if track == "renderer" else None}
+    for c in range(len(tr["cycles"]) + 1, cycles + 1):
         t = time.time()
-        out = CACHE / f"gpu_r{c}.pt"
+        out = CACHE / f"gpu_{track}_c{c}.pt"
         txt = run([sys.executable, "renderer.py", "--device", args.device, "--widths", args.widths, "--resume", str(best_file),
                    "--epochs", str(args.epochs), "--lr", str(args.lr), "--bs", str(args.bs), "--cosine", "--fp32",
-                   "--bits", str(args.bits), "--qat", "--loss", "flip", "--full-eval", "--threads", "2", "--port", str(args.renderer_port),
-                   "--out", str(out), *args.limit], LOGS / f"renderer_c{c}.log")
+                   "--bits", str(bits), "--qat", "--loss", "flip", "--full-eval", "--threads", "2", "--port", str(args.renderer_port),
+                   "--out", str(out), *args.limit], LOGS / f"{track}_c{c}.log")
         d = float(re.findall(r"전체 600장 disagreement ([0-9.]+)", txt)[-1])
         rec = {"cycle": c, "disagreement": d, "seg_term": 100 * d, "minutes": round((time.time() - t) / 60, 1)}
         tr["cycles"].append(rec)
@@ -91,27 +96,58 @@ def renderer_job(args, s: dict) -> None:
             shutil.copy(out, best_file)
             tr["best"] = rec
         save_summary(s)
-        print(f"== 사이클 {c}: 600장 불일치 {d:.6f} (최고 {tr['best']['disagreement']}) {rec['minutes']}분", flush=True)
-        push(args, f"colab: 렌더러 사이클 {c} 불일치 {d:.6f}")
+        print(f"== {track} 사이클 {c}: 600장 불일치 {d:.6f} (최고 {tr['best']['disagreement']}) {rec['minutes']}분", flush=True)
+        push(args, f"colab: {track} 사이클 {c} ({bits}비트) 불일치 {d:.6f}")
+
+
+def renderer_bytes(path: Path, widths: str, bits: int) -> int:
+    """archive 에 들어갈 렌더러 섹션 크기 (inflate 와 같은 포장)."""
+    sys.path[:0] = [str(VCC / "submissions" / "semantic_cpu")]
+    import torch
+    import archive
+    from model import pack_state
+
+    cfg = tuple(int(v) for v in widths.split(","))
+    return len(archive.pack_renderer(cfg, pack_state(torch.load(path, map_location="cpu"), bits)))
+
+
+def pick_renderer(args, s: dict):
+    """seg 항 + 렌더러 rate 항이 가장 작은 렌더러 (4비트 / 3비트 트랙)."""
+    cands = []
+    for track in ("renderer", "renderer3"):
+        f = RES / f"{track}_best.pt"
+        tr = s.get(track, {})
+        d = tr.get("best", {}).get("disagreement")
+        if f.exists() and d is not None:
+            nb = renderer_bytes(f, args.widths, tr["bits"])
+            cands.append((100 * d + 25 * nb / 37_545_489, f, tr["bits"], d, nb))
+    if not cands:
+        return SEED / "renderer_seed.pt", args.bits
+    cands.sort(key=lambda x: x[0])
+    for sc, f, b, d, nb in cands:
+        print(f"후보 {f.name}: {b}비트, 불일치 {d:.6f}, {nb:,} B → seg+렌더러 rate {sc:.4f}", flush=True)
+    s["renderer_choice"] = {"file": cands[0][1].name, "bits": cands[0][2], "disagreement": cands[0][3], "bytes": cands[0][4], "seg_plus_rate": round(cands[0][0], 5)}
+    return cands[0][1], cands[0][2]
 
 
 def pose_job(args, s: dict) -> None:
     """최고 렌더러에 맞춰 pose 재피팅: 정규화 손실 + 기저 학습 → 일반 MSE → 낮은 학습률 다듬기."""
-    renderer = RES / "renderer_best.pt" if (RES / "renderer_best.pt").exists() else SEED / "renderer_seed.pt"
+    renderer, rbits = pick_renderer(args, s)
     start = SEED / "pose2_seed.bin"
-    common = ["--device", args.device, "--renderer", str(renderer), "--renderer-cfg", args.widths, "--rbits", str(args.bits),
+    common = ["--device", args.device, "--renderer", str(renderer), "--renderer-cfg", args.widths, "--rbits", str(rbits),
               "--cbits", "10", "--q-epochs", str(args.q_epochs), "--greedy-rounds", "1", "--threads", "2", "--port", str(args.pose_port), *args.limit]
     main_out, pol_out = CACHE / "gpu_pose_main.bin", CACHE / "gpu_pose_pol.bin"
     t = time.time()
     txt1 = run([sys.executable, "pose_refine.py", "--pose2", str(start), *common, "--epochs", str(args.pose_epochs), "--lr", "0.01",
-                "--train-b", "0.02", "--dimw", "1.0", "--plain-epochs", str(args.plain_epochs), "--out", str(main_out)], LOGS / "pose_main.log")
+                "--train-b", "0.02", "--dimw", "1.0", "--plain-epochs", str(args.plain_epochs), "--bbits", str(args.pose_bbits),
+                *(["--b-qat"] if args.pose_bbits < 6 else []), "--out", str(main_out)], LOGS / "pose_main.log")
     txt2 = run([sys.executable, "pose_refine.py", "--pose2", str(main_out), *common, "--epochs", str(args.polish_epochs), "--lr", "0.001",
                 "--out", str(pol_out)], LOGS / "pose_polish.log")
     found = re.compile(r"평가 경로 posenet_dist ([0-9.]+)")
     d1, d2 = float(found.findall(txt1)[-1]), float(found.findall(txt2)[-1])
     best, d = (pol_out, d2) if d2 <= d1 else (main_out, d1)
     shutil.copy(best, RES / "pose2_best.bin")
-    s["pose"] = {"renderer": renderer.name, "renderer_cycle": s.get("renderer", {}).get("best", {}).get("cycle", 0),
+    s["pose"] = {"renderer": renderer.name, "rbits": rbits, "bbits": args.pose_bbits,
                  "posenet_main": d1, "posenet_polish": d2, "posenet_best": d, "pose_term": round((10 * d) ** 0.5, 5),
                  "minutes": round((time.time() - t) / 60, 1)}
     save_summary(s)
@@ -130,6 +166,8 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--bs", type=int, default=4)
     ap.add_argument("--pose-epochs", type=int, default=200)
+    ap.add_argument("--pose-bbits", type=int, default=5, help="pose 기저 B 저장 비트 (6 미만이면 기저 QAT)")
+    ap.add_argument("--r3-cycles", type=int, default=4, help="3비트 렌더러 트랙 사이클 수")
     ap.add_argument("--push", action="store_true", help="결과를 colab-results 브랜치로 push")
     ap.add_argument("--renderer-port", type=int, default=8020, help="렌더러 학습 livevis 포트")
     ap.add_argument("--pose-port", type=int, default=8014, help="pose 피팅 livevis 포트")
@@ -140,7 +178,7 @@ def main():
         global RES, LOGS, SUMMARY
         RES = HERE / "results_smoke"
         LOGS, SUMMARY = RES / "logs", RES / "summary.json"
-        args.epochs, args.cycles, args.pose_epochs = 1, 2, 2
+        args.epochs, args.cycles, args.pose_epochs, args.r3_cycles = 1, 2, 2, 1
         args.plain_epochs, args.polish_epochs, args.q_epochs, args.limit = 1, 1, 1, ["--limit", "8"]
 
     RES.mkdir(parents=True, exist_ok=True)
@@ -150,6 +188,8 @@ def main():
     jobs = [j.strip() for j in args.jobs.split(",") if j.strip()]
     if "renderer" in jobs:
         renderer_job(args, s)
+    if "renderer3" in jobs:
+        renderer_job(args, s, track="renderer3", bits=3, cycles=args.r3_cycles, start=RES / "renderer_best.pt")
     if "pose" in jobs:
         pose_job(args, s)
     print("\n모든 작업 끝:", json.dumps(s, indent=2, ensure_ascii=False))

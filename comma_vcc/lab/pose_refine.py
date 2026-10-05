@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--port", type=int, default=8014)
     ap.add_argument("--train-b", type=float, default=0.0, help="> 0 이면 기저 B 도 이 학습률로 함께 학습 (렌더러가 바뀌어 회전 차원이 나빠졌을 때)")
     ap.add_argument("--bbits", type=int, default=6)
+    ap.add_argument("--b-qat", action="store_true", help="기저 학습 때 B 를 --bbits 격자로 가짜 양자화 (STE) → 저비트 기저에 적응")
     ap.add_argument("--plain-epochs", type=int, default=0, help="본 학습(가중/B 학습) 뒤 B 고정 + 일반 MSE 로 더 학습할 에폭")
     ap.add_argument("--dimw", type=float, default=0.0, help="본 학습 손실의 차원별 가중 (1/분산)^dimw (양자화 단계는 일반 MSE)")
     ap.add_argument("--device", default="cpu", help="cpu | cuda (Colab GPU)")
@@ -82,6 +83,12 @@ def main():
     def save_state(phase, ep):
         torch.save({"phase": phase, "ep": ep, "A": [x.detach().cpu() for x in A], "C": [x.detach().cpu() for x in C], "B": B.detach().cpu(), "B_new": B_new}, state_path)
 
+    def fq_b(Bt):
+        """B 를 저장 격자(기저별 스케일, --bbits)로 가짜 양자화. 기울기는 그대로 통과."""
+        qm = 2 ** (args.bbits - 1) - 1
+        sc = Bt.detach().abs().amax((1, 2, 3), keepdim=True) / qm
+        return Bt + ((Bt / sc).round().clamp(-qm, qm) * sc - Bt).detach()
+
     def run(epochs, lr, q=None, weighted=True, with_b=True, phase=None, start=0):
         opts = [torch.optim.Adam([A[j], C[j]], lr=lr) for j in range(len(batches))]
         for ep in range(start, epochs):
@@ -91,7 +98,8 @@ def main():
                     g["lr"] = cur_lr
                 train_b = opt_B is not None and q is None and with_b
                 a, c = (A[j], C[j]) if q is None else q(A[j], C[j])
-                out = pose_out(net, even_frames_prev(prev[b], a, c, B if train_b else B.detach()), odd[b])
+                Bf = (fq_b(B) if args.b_qat else B) if train_b else B.detach()
+                out = pose_out(net, even_frames_prev(prev[b], a, c, Bf), odd[b])
                 sq = (out - target[b]) ** 2
                 loss = (sq * wdim).sum() if (q is None and weighted) else sq.sum()
                 opts[j].zero_grad()
