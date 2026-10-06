@@ -185,8 +185,11 @@ class QNet:
         return cls(layers), off
 
 
-def quantize_ctxnet(state_dict: dict, calib_inputs: list[np.ndarray], wbits: int = 8, dils=None) -> QNet:
-    """float CtxNet (Conv-ReLU 반복 + 마지막 1x1) → QNet. calib_inputs: build_input_q 결과 몇 개."""
+def quantize_ctxnet(state_dict: dict, calib_inputs: list[np.ndarray], wbits: int = 8, dils=None, wq: dict | None = None) -> QNet:
+    """float CtxNet (Conv-ReLU 반복 + 마지막 1x1) → QNet. calib_inputs: build_input_q 결과 몇 개.
+
+    wq: 층 이름 → (정수 가중치, 출력 채널별 스케일). 주면 그 양자화를 그대로 쓴다 (self-compression 학습 결과).
+    """
     convs = [(k[: -len(".weight")], v) for k, v in state_dict.items() if k.endswith(".weight")]
     x_float = [torch.from_numpy(x.astype(np.float32)) / Q_IN for x in calib_inputs]  # float 모델 입력 (0..1)
     s_in = 1.0 / Q_IN  # 정수 입력 1 단위의 실수값
@@ -197,8 +200,12 @@ def quantize_ctxnet(state_dict: dict, calib_inputs: list[np.ndarray], wbits: int
         last = li == len(convs) - 1
         dil = 1 if (dils is None or li >= len(dils)) else dils[li]
         pad = dil * (Wf.shape[-1] // 2)
-        s_w = Wf.abs().amax((1, 2, 3)).clamp_min(1e-8) / qmax  # 출력 채널별
-        W_q = (Wf / s_w.view(-1, 1, 1, 1)).round().clamp(-qmax, qmax)
+        if wq is not None and name in wq:
+            W_q, s_w = (torch.as_tensor(v).float() for v in wq[name])
+            Wf = W_q * s_w.view(-1, 1, 1, 1)  # 활성 범위도 학습한 (양자화된) 가중치로 잰다
+        else:
+            s_w = Wf.abs().amax((1, 2, 3)).clamp_min(1e-8) / qmax  # 출력 채널별
+            W_q = (Wf / s_w.view(-1, 1, 1, 1)).round().clamp(-qmax, qmax)
         # float 모델로 다음 활성값 범위 측정
         ys = [F.conv2d(x, Wf, bf, padding=pad, dilation=dil) for x in x_float]
         if last:

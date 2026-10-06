@@ -8,6 +8,7 @@ SegNet(render(M)) 의 argmax 가 M 과 같아지도록 학습한다. 렌더러 �
 from __future__ import annotations
 
 import argparse
+import os
 import io
 import time
 
@@ -50,10 +51,16 @@ def ste_params(G, bits):
 
 
 @torch.inference_mode()
-def evaluate(G, net, seg, idx, bs=8, rounded=False, bits=8):
-    """inflate 와 같은 조건: 저장/복원 왕복 가중치, float 출력 (서브픽셀 확장으로 거의 그대로 전달된다)."""
+def evaluate(G, net, seg, idx, bs=8, rounded=False, bits=8, sd=None):
+    """inflate 와 같은 조건: 저장/복원 왕복 가중치, float 출력 (서브픽셀 확장으로 거의 그대로 전달된다).
+
+    sd 를 주면 그 (이미 양자화된) 가중치를 그대로 쓴다 (self-compression 의 export).
+    """
     Gq = copy.deepcopy(G)
-    quantize_roundtrip(Gq, bits)
+    if sd is None:
+        quantize_roundtrip(Gq, bits)
+    else:
+        Gq.load_state_dict(sd)
     dev = next(Gq.parameters()).device
     errs = []
     for i in range(0, len(idx), bs):
@@ -69,6 +76,9 @@ def main():
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--device", default="cpu", help="cpu | cuda (Colab GPU)")
     ap.add_argument("--limit", type=int, default=0, help="> 0 이면 앞 N장만 (드라이버 점검용)")
+    ap.add_argument("--self-compress", type=float, default=0.0,
+                    help="> 0 이면 채널별 비트 수를 학습 (selfcomp.py). 1.0 = 점수 공식에 맞춘 크기/불일치 trade-off (--bits 는 시작 비트)")
+    ap.add_argument("--sc-lr", type=float, default=1e-2, help="self-compression 의 비트/스케일 학습률")
     ap.add_argument("--bs", type=int, default=4)
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--threads", type=int, default=4)
@@ -119,7 +129,24 @@ def main():
             print(f"체크포인트에 없는 FiLM 파라미터는 초기값(변조 없음)으로 시작: {missing}")
     G.to(dev)
     print(f"renderer params: {sum(p.numel() for p in G.parameters()):,} ({dev})")
-    opt = torch.optim.Adam(G.parameters(), lr=args.lr)
+    sc = None
+    groups = [{"params": list(G.parameters()), "lr": args.lr}]
+    if args.self_compress > 0:
+        from selfcomp import SelfCompress
+
+        sc_state = (args.resume + ".sc.pt") if args.resume else None
+        if sc_state and os.path.exists(sc_state):  # self-compression 을 이어서: float 가중치와 비트/스케일
+            st = torch.load(sc_state, map_location="cpu")
+            G.load_state_dict(st["float"])
+            sc = SelfCompress(G, st["init_bits"]).to(dev)
+            sc.load_state_dict(st["sc"])
+        else:
+            sc = SelfCompress(G, float(args.bits)).to(dev)
+        # 점수 = 100·불일치 + 25·바이트/원본 → 손실(≈불일치) 단위로 가중치당 1비트의 값 (xz 가 비트 수의 약 0.75 로 줄인다)
+        gamma = args.self_compress * 0.75 * 25 * sc.total / 8 / 37_545_489 / 100
+        groups.append({"params": list(sc.parameters()), "lr": args.sc_lr})
+        print(f"self-compression: γ {gamma:.3g} (가중치 {sc.total:,}), {sc.summary()}", flush=True)
+    opt = torch.optim.Adam(groups)
     steps = args.epochs * (len(seg) // args.bs)
     if args.cosine:
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, steps, eta_min=args.lr * 0.02)
@@ -137,7 +164,9 @@ def main():
         perm = np.random.default_rng(ep).permutation(len(seg))
         for b in range(0, len(perm) - args.bs + 1, args.bs):
             m = torch.from_numpy(seg[perm[b : b + args.bs]]).long().to(dev)
-            if args.qat:
+            if sc is not None:
+                img = torch.func.functional_call(G, sc.params(G), (m, torch.from_numpy(perm[b : b + args.bs])))
+            elif args.qat:
                 img = torch.func.functional_call(G, ste_params(G, args.bits), (m, torch.from_numpy(perm[b : b + args.bs])))
             else:
                 img = render(G, m, torch.from_numpy(perm[b : b + args.bs]))
@@ -158,6 +187,8 @@ def main():
             else:
                 # argmax 를 뒤집는 데 직접 관여하는 margin 손실: 정답 logit 이 다른 것보다 2 이상 크게
                 loss = F.cross_entropy(logits, m) + F.relu(2.0 - margin).mean()
+            if sc is not None:
+                loss = loss + gamma * sc.bits_per_weight()
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -170,7 +201,15 @@ def main():
             viz.log(step, loss=loss.item(), train_disagreement_bf16=err, lr=sched.get_last_lr()[0])
             if step % 50 == 0:
                 print(f"ep {ep} step {step}/{steps} loss {loss.item():.4f} err {err:.5f} ({time.time() - t0:.0f}s)", flush=True)
-        errs = evaluate(G, net, seg, val_idx, bits=args.bits, bs=16 if dev.type == "cuda" else 8)
+        sd_exp = None
+        if sc is not None:
+            sd_exp, packed = sc.export(G)
+            import archive
+
+            nbytes = len(archive.pack_renderer(G.cfg, packed))
+            viz.log(step, renderer_bytes=nbytes, bits_per_weight=sc.bits_per_weight().item())
+            print(f"   self-compression: 렌더러 {nbytes:,} B, {sc.summary()}", flush=True)
+        errs = evaluate(G, net, seg, val_idx, bits=args.bits, bs=16 if dev.type == "cuda" else 8, sd=sd_exp)
         viz.log(step, val_disagreement_fp32=errs.mean().item(), val_seg_term=100 * errs.mean().item())
         with torch.inference_mode():
             m = torch.from_numpy(seg[val_idx[:1]]).to(dev)
@@ -180,10 +219,16 @@ def main():
         vis = np.concatenate([img[0].round().clamp(0, 255).permute(1, 2, 0).byte().numpy(), PALETTE[out[0].numpy()]], 1)
         vis[:, SW:][(out[0] != m[0]).numpy()] = [255, 0, 255]
         viz.image("render", png(vis), step=step, caption=f"epoch {ep}: 왼쪽 렌더, 오른쪽 SegNet 결과(분홍=불일치). val {errs.mean():.5f}")
-        torch.save({k: v.detach().cpu() for k, v in G.state_dict().items()}, args.out)
+        if sc is not None:  # out = inflate 와 같은 (양자화된) 가중치, .q = archive 에 넣을 바이트, .sc.pt = 이어서 학습용
+            torch.save(sd_exp, args.out)
+            open(args.out + ".q", "wb").write(packed)
+            torch.save({"float": {k: v.detach().cpu() for k, v in G.state_dict().items()},
+                        "sc": {k: v.detach().cpu() for k, v in sc.state_dict().items()}, "init_bits": float(args.bits)}, args.out + ".sc.pt")
+        else:
+            torch.save({k: v.detach().cpu() for k, v in G.state_dict().items()}, args.out)
         print(f"== epoch {ep} val disagreement {errs.mean():.5f} (max {errs.max():.5f})", flush=True)
     if args.full_eval:
-        errs = evaluate(G, net, seg, np.arange(len(seg)), bits=args.bits, bs=16 if dev.type == "cuda" else 8)
+        errs = evaluate(G, net, seg, np.arange(len(seg)), bits=args.bits, bs=16 if dev.type == "cuda" else 8, sd=sd_exp)
         print(f"== 전체 600장 disagreement {errs.mean():.6f} → seg 항 {100 * errs.mean():.4f}", flush=True)
 
 

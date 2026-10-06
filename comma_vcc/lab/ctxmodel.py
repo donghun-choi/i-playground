@@ -62,6 +62,18 @@ def load_ctx(path):
     return m, sd, dils
 
 
+def fq_weights(model, bits: int) -> dict:
+    """conv 가중치를 bits 비트 격자로 (출력 채널별 max/qmax, segcodec.quantize_ctxnet 과 같은 규칙), STE."""
+    qmax = 2 ** (bits - 1) - 1
+    out = {}
+    for k, p in model.named_parameters():
+        if k.endswith(".weight"):
+            sc_ = p.detach().abs().amax((1, 2, 3), keepdim=True).clamp_min(1e-8) / qmax
+            p = p + ((p / sc_).round().clamp(-qmax, qmax) * sc_ - p).detach()
+        out[k] = p
+    return out
+
+
 def frame_maps(seg, t):
     return seg[t : t + 1], (seg[t - 1 : t] if t >= 1 else None), (seg[t - 2 : t - 1] if t >= 2 else None)
 
@@ -94,6 +106,11 @@ def main():
     ap.add_argument("--out", default=str(CACHE / "ctxnet.pt"))
     ap.add_argument("--init", default=None)
     ap.add_argument("--dils", default=None, help="층별 dilation, 예: 1,2,4,2,1")
+    ap.add_argument("--self-compress", type=float, default=0.0,
+                    help="> 0 이면 채널별 비트 수를 학습 (selfcomp.py, 시작 --sc-init-bits). 1.0 = 가중치 1비트 ≈ 스트림 1비트")
+    ap.add_argument("--sc-init-bits", type=float, default=6.0)
+    ap.add_argument("--sc-lr", type=float, default=1e-2)
+    ap.add_argument("--qat-bits", type=int, default=0, help="> 0 이면 가중치를 이 비트 격자로 가짜 양자화해서 학습 (quantize_ctxnet 과 같은 출력 채널별 스케일)")
     args = ap.parse_args()
 
     from livevis import LiveVis
@@ -108,7 +125,17 @@ def main():
         ck = torch.load(args.init)
         model.load_state_dict(ck["sd"] if "sd" in ck else ck)
     print(f"ctxnet params {sum(p.numel() for p in model.parameters()):,}", flush=True)
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    sc = None
+    groups = [{"params": list(model.parameters()), "lr": args.lr}]
+    if args.self_compress > 0:
+        from selfcomp import SelfCompress
+
+        sc = SelfCompress(model, args.sc_init_bits)
+        # 손실 = 대상 칸당 nats. 스트림 전체 비트 ≈ 손실/ln2 × 부호화 칸 수 (601장 × 384·512) → 가중치 1비트와 같은 값으로
+        gamma = args.self_compress * 0.75 * sc.total / (601 * SH * SW / math.log(2))
+        groups.append({"params": list(sc.parameters()), "lr": args.sc_lr})
+        print(f"self-compression: γ {gamma:.3g}, {sc.summary()}", flush=True)
+    opt = torch.optim.Adam(groups)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=args.steps, pct_start=0.05)
     viz = LiveVis(f"comma vcc · seg 문맥 모델 ch{args.ch} L{args.layers}", port=args.port).start()
     eval_frames = list(range(3, 600, 60))  # 10장
@@ -136,21 +163,45 @@ def main():
         x = torch.cat(xs)
         tmask = torch.cat(tg)
         g = torch.cat(gs)
-        logits = model(x)
+        if sc is not None:
+            logits = torch.func.functional_call(model, sc.params(model), (x,))
+        elif args.qat_bits:
+            logits = torch.func.functional_call(model, fq_weights(model, args.qat_bits), (x,))
+        else:
+            logits = model(x)
         nll = F.cross_entropy(logits, g, reduction="none")[tmask]
         loss = nll.mean()
+        if sc is not None:
+            loss = loss + gamma * sc.bits_per_weight()
         opt.zero_grad()
         loss.backward()
         opt.step()
         sched.step()
         viz.log(step, train_bits_per_target=loss.item() / math.log(2))
         if step % args.eval_every == 0 or step == args.steps:
-            tot = eval_bits(model, seg, eval_frames)
+            emodel, wq = model, None
+            if sc is not None:  # 학습한 양자화 그대로 평가 / 저장
+                import copy
+
+                sd_exp, _ = sc.export(model)
+                emodel = copy.deepcopy(model)
+                emodel.load_state_dict(sd_exp)
+                wq = {}
+                for k in sc.names:
+                    q, s_ = sc._q(k, dict(model.named_parameters())[k].detach())
+                    wq[k[: -len(".weight")]] = (q.detach().clamp(-127, 127), s_.detach().half().float())
+            tot = eval_bits(emodel, seg, eval_frames)
             bpf = sum(tot.values()) / 8 / len(eval_frames)
             viz.log(step, eval_bytes_per_frame=bpf, **{f"B/frame {k}": v / 8 / len(eval_frames) for k, v in tot.items()})
             print(f"step {step}: {bpf:.0f} B/frame (coarse 제외) ({time.time() - t0:.0f}s) "
                   + " ".join(f"{k}:{v / 8 / len(eval_frames):.0f}" for k, v in tot.items()), flush=True)
-            torch.save({"sd": model.state_dict(), "dils": model.dils}, args.out)
+            if sc is not None:
+                print(f"   {sc.summary()}", flush=True)
+                viz.log(step, bits_per_weight=sc.bits_per_weight().item())
+                torch.save({"sd": emodel.state_dict(), "dils": model.dils, "wq": wq,
+                            "float": model.state_dict(), "sc": sc.state_dict()}, args.out)
+            else:
+                torch.save({"sd": model.state_dict(), "dils": model.dils}, args.out)
 
 
 if __name__ == "__main__":
