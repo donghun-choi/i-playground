@@ -180,16 +180,19 @@ def pose_job(args, s: dict) -> None:
         ps.clear()
         ps.update({"renderer": renderer.name, "rbits": rbits, "variants": {}})
     variants = ps.setdefault("variants", {})
-    for res in [v.strip() for v in args.pose_variants.split(",") if v.strip()]:
-        key = f"{res}_b{args.pose_bbits}"
+    for var in [v.strip() for v in args.pose_variants.split(",") if v.strip()]:
+        # 변형: 기저 해상도 + 저장 비트, 예) 24x32b6, 24x32b5, 12x16b6 (b 를 생략하면 --pose-bbits)
+        res, _, bb = var.partition("b")
+        bbits = int(bb) if bb else args.pose_bbits
+        key = f"{res}_b{bbits}"
         if key in variants:
             continue
         t = time.time()
         bres = [] if res == "24x32" else ["--b-res", res.replace("x", ",")]
         main_out, pol_out = CACHE / f"gpu_pose_{key}_main.bin", CACHE / f"gpu_pose_{key}_pol.bin"
         txt1 = run([sys.executable, "pose_refine.py", "--pose2", str(start), *common, "--epochs", str(args.pose_epochs), "--lr", "0.01",
-                    "--train-b", "0.02", "--dimw", "1.0", "--plain-epochs", str(args.plain_epochs), "--bbits", str(args.pose_bbits),
-                    *(["--b-qat"] if args.pose_bbits < 6 else []), *bres, "--out", str(main_out)], LOGS / f"pose_{key}_main.log")
+                    "--train-b", "0.02", "--dimw", "1.0", "--plain-epochs", str(args.plain_epochs), "--bbits", str(bbits),
+                    *(["--b-qat"] if bbits < 6 else []), *bres, "--out", str(main_out)], LOGS / f"pose_{key}_main.log")
         txt2 = run([sys.executable, "pose_refine.py", "--pose2", str(main_out), *common, "--epochs", str(args.polish_epochs), "--lr", "0.001",
                     "--out", str(pol_out)], LOGS / f"pose_{key}_polish.log")
         d1, d2 = float(found.findall(txt1)[-1]), float(found.findall(txt2)[-1])
@@ -219,7 +222,7 @@ def main():
     ap.add_argument("--bs", type=int, default=4)
     ap.add_argument("--pose-epochs", type=int, default=200)
     ap.add_argument("--pose-bbits", type=int, default=5, help="pose 기저 B 저장 비트 (6 미만이면 기저 QAT)")
-    ap.add_argument("--pose-variants", default="24x32,12x16", help="기저 해상도 변형 (쉼표로)")
+    ap.add_argument("--pose-variants", default="24x32b6,24x32b5,12x16b6", help="기저 해상도+비트 변형 (쉼표로, 앞에서부터 돌린다)")
     ap.add_argument("--pose-cbits", type=int, default=9, help="pose 계수 격자 비트 (9 는 10 과 같은 pose 항에 -1.35KB)")
     ap.add_argument("--r3-cycles", type=int, default=4, help="3비트 렌더러 트랙 사이클 수")
     ap.add_argument("--sc-cycles", type=int, default=4, help="self-compression 렌더러 트랙 사이클 수")
