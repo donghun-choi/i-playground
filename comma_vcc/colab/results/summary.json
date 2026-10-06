@@ -45,13 +45,23 @@
         "disagreement": 0.000274,
         "seg_term": 0.0274,
         "minutes": 9.7
+      },
+      {
+        "cycle": 7,
+        "disagreement": 0.000261,
+        "seg_term": 0.0261,
+        "bytes": 31054,
+        "score": 0.04678,
+        "minutes": 9.8
       }
     ],
     "best": {
-      "cycle": 6,
-      "disagreement": 0.000274,
-      "seg_term": 0.0274,
-      "minutes": 9.7
+      "cycle": 7,
+      "disagreement": 0.000261,
+      "seg_term": 0.0261,
+      "bytes": 31054,
+      "score": 0.04678,
+      "minutes": 9.8
     }
   }
 }
