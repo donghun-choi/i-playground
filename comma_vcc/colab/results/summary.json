@@ -53,15 +53,23 @@
         "bytes": 31054,
         "score": 0.04678,
         "minutes": 9.8
+      },
+      {
+        "cycle": 8,
+        "disagreement": 0.00025,
+        "seg_term": 0.025,
+        "bytes": 31185,
+        "score": 0.04576,
+        "minutes": 9.7
       }
     ],
     "best": {
-      "cycle": 7,
-      "disagreement": 0.000261,
-      "seg_term": 0.0261,
-      "bytes": 31054,
-      "score": 0.04678,
-      "minutes": 9.8
+      "cycle": 8,
+      "disagreement": 0.00025,
+      "seg_term": 0.025,
+      "bytes": 31185,
+      "score": 0.04576,
+      "minutes": 9.7
     }
   }
 }
