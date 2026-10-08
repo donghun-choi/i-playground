@@ -35,10 +35,10 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v5d2, 점수 0.1778)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6, 점수 0.1638)
 
 ```
-archive (202KB) = 정수 문맥 CNN (17KB) + seg 맵 601장 무손실 스트림 (124KB) + 렌더러 (31KB, 폭 24·32·40, 4비트) + pose (30KB, 계수는 Rice 부호)
+archive (196KB) = 정수 문맥 CNN (14KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (123KB) + 렌더러 (31KB, 폭 24·32·40, 4비트) + pose (29KB, 계수 9비트 Rice 부호)
 
 seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본 짝수 프레임 0 의 맵 1장)
 홀수 프레임 i   = 렌더러(M_i)                                         → SegNet 이 M_i 를 내도록 학습
@@ -60,7 +60,7 @@ seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본
 | `lab/build_archive.py` | 정수화 + 인코드 + archive.zip 조립 |
 | 나머지 `lab/*_exp.py`, `analyze.py`, `seg_errors.py`, `bits_breakdown.py` | 실험/분석 |
 
-### v5d 재현 (CPU 4코어, 대략 30시간)
+### v6 재현 (CPU 4코어 + Colab T4, 대략 35시간)
 ```bash
 cd comma_vcc/lab
 ../.venv/bin/python build_cache.py                                                   # 3분
@@ -95,6 +95,14 @@ cd comma_vcc/lab
 ../.venv/bin/python renderer.py --widths 24,32,40 --resume ../cache/renderer_w24flip4b.pt --epochs 10 --lr 3e-4 --cosine --fp32 --bits 4 --qat --loss flip --full-eval --out ../cache/renderer_w24flip4c.pt
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v5c2.bin --renderer ../cache/renderer_w24flip4c.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 10 --epochs 200 --lr 0.01 --train-b 0.02 --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_v5d.bin
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24d2.pt --cbits 6 --renderer ../cache/renderer_w24flip4c.pt --renderer-cfg 24,32,40 --rbits 4 --pose2 ../cache/pose2_v5d.bin
+# (여기까지가 v5d) v6: 렌더러는 Colab GPU (colab/vcc_gpu.ipynb, 4비트 flip 10에폭 × 6사이클, 사이클마다 600장 평가로 최고를 이어서)
+#   → colab-results 브랜치의 comma_vcc/colab/results/renderer_best.pt 를 ../cache/renderer_colab_c6.pt 로
+# 문맥 모델: 5비트 QAT → self-compression (채널별 비트/스케일 학습, 크기 손실 ×4)
+../.venv/bin/python ctxmodel.py --init ../cache/ctxnet_c24d2.pt --ch 24 --layers 5 --dils 1,2,4,2,1 --qat-bits 5 --steps 6000 --lr 1e-3 --threads 4 --out ../cache/ctxnet_c24q5.pt
+../.venv/bin/python ctxmodel.py --init ../cache/ctxnet_c24q5.pt --ch 24 --layers 5 --dils 1,2,4,2,1 --self-compress 4.0 --sc-init-bits 5 --steps 6000 --lr 5e-4 --threads 4 --out ../cache/ctxnet_c24sc4.pt
+# pose: 계수 격자 9비트 (10비트와 같은 pose 항에 -1.35KB)
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v5d2.bin --renderer ../cache/renderer_colab_c6.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 9 --epochs 200 --lr 0.01 --train-b 0.02 --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_v6.bin
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sc4.pt --cbits 5 --renderer ../cache/renderer_colab_c6.pt --renderer-cfg 24,32,40 --rbits 4 --pose2 ../cache/pose2_v6.bin
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -167,6 +175,14 @@ CPU 로는 렌더러 flip 학습 1에폭이 약 8분이라, 같은 레시피를 
 - 프레임별 FiLM (프레임마다 8차원 코드로 병목/디코더 특징 변조, `--film 8`): 같은 조건 10에폭 대조군과 비교하면 600장 불일치
   0.000374 vs 0.000378 로 거의 같은데 렌더러가 +5.1KB → 손해. 개선은 FiLM 이 아니라 추가 학습에서 나왔다.
 - 문맥 모델 가중치를 6 → 5비트로 (학습 후 양자화): 모델 16.6KB → 13.4KB 지만 스트림 124.4KB → 141.6KB 로 손해.
+- (v6) Colab T4 에서 같은 렌더러 레시피(4비트 flip 10에폭)를 사이클로 반복: 600장 불일치 0.000378 → 0.000348 → 0.000325 → 0.000314 → 0.000305 → 0.000291 → 0.000274
+  (사이클당 9.7분, CPU 의 약 9배). GPU 에서 잰 불일치와 CPU 에서 잰 값이 같았다 (0.000274).
+- 문맥 모델: 가중치 5비트 QAT (`--qat-bits 5`) → 모델 16.6KB → 13.4KB 인데 스트림도 124.4KB → 123.7KB.
+  이어서 self-compression (Cséfalvay 2023: 채널별 비트/스케일 학습 + 크기 손실) ×4 → 13.6KB + 123.1KB = 136.7KB (원래 141.1KB).
+  점수 공식 기준(×1) 크기 손실로는 비트가 거의 안 줄었다 — 작은 모델이라 줄일 채널이 별로 없다.
+- pose 계수 격자 10 → 9비트: 탐욕 ±1 탐색이 양자화 손해를 메워서 pose 항은 같고 -1.35KB.
+  기저 B 를 학습 없이 5비트로 깎으면 pose 항 0.0038 → 0.054 (기저는 함께 학습해야 함).
+- 효과 없던 것: 패스별 확률 온도 보정 (-0.04%, 문맥 모델이 이미 잘 보정됨), 순수 엔트로피 부호 (xz 가 이미 0차 엔트로피 근처, 전체 -1.4KB).
 - pose 계수는 시간 상관이 없다 (차분 분산이 값 분산의 2배) → 차분 + xz 대신 (값 - 평균) 을 Rice 부호로: 14.7KB → 12.4KB (`pos3` 섹션).
 
 ### v2 에서 바꾼 것과 근거
@@ -207,3 +223,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v5c | 0.000440 | 0.0000066 | 0.00538 | **0.1865** | 렌더러 4비트 QAT + flip 22에폭 더 (30.5KB), pose 150에폭 다시 (기저 이어서). inflate 367s + 평가 231s |
 | semantic_cpu v5d | 0.000378 | 0.0000035 | 0.00538 | **0.1780** | 렌더러 4비트 flip 10에폭 더, pose 200에폭 (기저를 계속 이어 학습할수록 회전 차원이 더 맞음). inflate 369s + 평가 228s |
 | semantic_cpu v5d2 | 0.000378 | 0.0000032 | 0.00538 | **0.1778** | v5d + pose 낮은 학습률 다듬기 40에폭 (`--epochs 40 --lr 0.001`, B 고정) |
+| semantic_cpu v6 | 0.000274 | 0.0000032 | 0.00523 | **0.1638** | 렌더러 Colab GPU 6사이클 (seg 0.0378 → 0.0274), 문맥 모델 5비트 QAT + self-compression (-4.3KB), pose 계수 9비트 (-1.35KB). inflate 402s + 평가 248s |
