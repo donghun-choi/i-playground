@@ -35,15 +35,15 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.2, 점수 0.1569)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.3, 점수 0.1536)
 
 ```
-archive (193KB) = 정수 문맥 CNN (14KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (123KB) + 렌더러 (31KB, 폭 24·32·40, 4비트) + pose (25KB, 기저 5비트, 계수 9비트 Rice 부호)
+archive (185KB) = 정수 문맥 CNN (14KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (123KB) + 렌더러 (31KB, 폭 24·32·40, 4비트) + pose (17KB, 기저 8개 5비트, 계수 8비트 Rice 부호)
 
 seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본 짝수 프레임 0 의 맵 1장)
 홀수 프레임 i   = 렌더러(M_i)                                         → SegNet 이 M_i 를 내도록 학습
 짝수 프레임 i   = 아핀_i(홀수 프레임 i-1) + bicubic(Σ_k c[i,k] · B_k)    → PoseNet 이 원본 pose 를 내도록 피팅
-                  (아핀 6개 + 계수 12개는 쌍마다, 기저 B 12x3x24x32 는 공유)
+                  (아핀 6개 + 계수 8개는 쌍마다, 기저 B 8x3x24x32 는 공유)
 1164x874 기록    = 512x384 float 이미지를 2x2 서브픽셀 정수로 펼침 (평가의 bilinear 축소가 그대로 되돌림)
 ```
 
@@ -108,7 +108,10 @@ cd comma_vcc/lab
 #   렌더러가 바뀌면 출력 색이 흘러가서 (c6 vs c8 평균 6.6레벨) pose 를 처음부터 다시 맞춰야 한다
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v6_qf.bin --renderer ../cache/renderer_colab_c8.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 9 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 2 --qf --out ../cache/pose2_c8.bin
 #   (pose2_v6_qf.bin = pose2_v6_b5q.bin 에서 --epochs 0 --q-epochs 0 --keep-grid --qf --greedy-rounds 3, 렌더러 c6 기준 pose 항 0.0050 → 0.0025)
-../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sc4.pt --cbits 5 --renderer ../cache/renderer_colab_c8.pt --renderer-cfg 24,32,40 --rbits 4 --pose2 ../cache/pose2_c8.bin
+# v6.3: pose 바이트 줄이기 (평가 경로 탐욕 탐색이 격자 손해를 메운다) - 계수 격자 8비트, 기저 12 → 8개
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_c8.bin --renderer ../cache/renderer_colab_c8.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 8 --bbits 5 --epochs 0 --lr 0.01 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_c8_cb8.bin
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_c8_cb8.bin --renderer ../cache/renderer_colab_c8.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 8 --keep-k 8 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_c8_k8.bin
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sc4.pt --cbits 5 --renderer ../cache/renderer_colab_c8.pt --renderer-cfg 24,32,40 --rbits 4 --pose2 ../cache/pose2_c8_k8.bin
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -195,6 +198,10 @@ CPU 로는 렌더러 flip 학습 1에폭이 약 8분이라, 같은 레시피를 
   탐욕 ±1 탐색이 float 경로에 과적합해서 학습 경로 d 6.8e-7 vs 실제 2.55e-6 (3.7배). 이 왕복을 원해상도를 만들지 않고 바로 계산하는 `fine_q`
   (위치별 256 조합 가중합 표에서 가장 가까운 값, 평가와 1e-4 이내)를 학습(STE)과 탐욕 탐색에 넣으니 같은 계수 격자에서 2.55e-6 → 6e-7 (pose 항 0.0050 → 0.0025).
   렌더러 c8 로 처음부터 다시 맞춘 것은 1.1e-6 (0.0034) 이지만 seg 항 -0.0024 가 더 커서 c8 을 쓴다.
+- (v6.3) pose 가 작아지자 (항 0.0034, d 1.1e-6) 바이트를 줄이는 쪽이 이득: 1바이트 = 점수 6.7e-7 이고, 이 근처에서 d 의 한계 비용은
+  √10/(2√d) ≈ 1500 이라 1KB 를 아끼면 d 가 40% 나빠져도 본전. pose 항 + pos3 rate 로 비교:
+  계수 격자 9비트 0.01996 → 8비트 0.01906 (d 그대로, -1.36KB) → 7비트 0.01898 (d 1.7e-6, -1.33KB 더; 8비트와 사실상 같아서 8비트).
+  기저 12 → 8개 (계수 에너지 × 기저 크기로 고르고 150에폭 다시): 회전 차원은 3배 나빠지지만 (d 2.9e-6, 항 0.0054) pos3 23.6KB → 17.0KB 라 0.0167.
 - pose 기저를 QAT 로 학습할 때 에폭별 평가가 float 기저를 써서 0번 차원이 엉뚱하게 크게 보였다 (실제 학습은 정상). 저장 격자 기저로 재도록 고침.
 - 효과 없던 것: 패스별 확률 온도 보정 (-0.04%, 문맥 모델이 이미 잘 보정됨), 순수 엔트로피 부호 (xz 가 이미 0차 엔트로피 근처, 전체 -1.4KB).
 - pose 계수는 시간 상관이 없다 (차분 분산이 값 분산의 2배) → 차분 + xz 대신 (값 - 평균) 을 Rice 부호로: 14.7KB → 12.4KB (`pos3` 섹션).
@@ -240,3 +247,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v6 | 0.000274 | 0.0000032 | 0.00523 | **0.1638** | 렌더러 Colab GPU 6사이클 (seg 0.0378 → 0.0274), 문맥 모델 5비트 QAT + self-compression (-4.3KB), pose 계수 9비트 (-1.35KB). inflate 402s + 평가 248s |
 | semantic_cpu v6.1 | 0.000274 | 0.0000026 | 0.00514 | **0.1608** | v6 + pose 기저 5비트 QAT 재학습 (pose 항 0.0057 → 0.0050, -3.6KB). inflate 430s |
 | semantic_cpu v6.2 | 0.000250 | 0.0000011 | 0.00514 | **0.1569** | 렌더러 Colab 사이클 8 (seg 0.0274 → 0.0250) + pose 를 평가 경로(서브픽셀 왕복, `--qf`)로 재피팅. inflate 419s |
+| semantic_cpu v6.3 | 0.000250 | 0.0000029 | 0.00493 | **0.1536** | pose 계수 8비트 + 기저 12 → 8개 (pos3 25.0KB → 17.0KB, pose 항 0.0034 → 0.0054). inflate 403s |
