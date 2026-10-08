@@ -67,6 +67,30 @@ def downsample(frames_u8: torch.Tensor) -> torch.Tensor:
     return F.interpolate(x, size=(SH, SW), mode="bilinear")
 
 
+def fine_q(x: torch.Tensor) -> torch.Tensor:
+    """(N,3,384,512) float → expand_fine 으로 원해상도 uint8 을 만든 뒤 평가 코드가 다시 축소한 값 (원해상도를 만들지 않고 바로).
+
+    fine_blocks 와 같은 선택: 기준값 + 위치별 256 조합 가중합 중 가장 가까운 것. 평가 경로와 1e-4 이내로 같다.
+    """
+    from model import _table
+
+    ss, _ = _table()
+    ss = ss.to(x.device)
+    n = x.shape[0]
+    xf = x.detach().permute(2, 3, 0, 1).reshape(SH * SW, n * 3)
+    base = xf.floor().clamp(1, 253)
+    r = (xf - base).contiguous()
+    j = torch.searchsorted(ss, r).clamp(1, 255)
+    lo, hi = ss.gather(1, j - 1), ss.gather(1, j)
+    v = torch.where((r - lo).abs() <= (hi - r).abs(), lo, hi)
+    return (base + v).reshape(SH, SW, n, 3).permute(2, 3, 0, 1).contiguous()
+
+
+def fine_q_ste(x: torch.Tensor) -> torch.Tensor:
+    """앞으로는 fine_q, 뒤로는 그대로 (STE)."""
+    return x + (fine_q(x) - x).detach()
+
+
 def yuv6(rgb: torch.Tensor) -> torch.Tensor:
     """frame_utils.rgb_to_yuv6 와 같은 수식인데 미분 가능 (원본은 no_grad + in-place)."""
     R, G, B = rgb[:, 0], rgb[:, 1], rgb[:, 2]

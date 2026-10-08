@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from common import CACHE, SH, SW, downsample, load_gt, nets, pose_out, setup_device
+from common import CACHE, SH, SW, downsample, fine_q, fine_q_ste, load_gt, nets, pose_out, setup_device
 import archive  # noqa: E402
 from model import parse_rcfg  # noqa: E402
 from model import even_frames_prev, expand_fine  # noqa: E402
@@ -45,6 +45,7 @@ def main():
     ap.add_argument("--dimw", type=float, default=0.0, help="본 학습 손실의 차원별 가중 (1/분산)^dimw (양자화 단계는 일반 MSE)")
     ap.add_argument("--device", default="cpu", help="cpu | cuda (Colab GPU)")
     ap.add_argument("--limit", type=int, default=0, help="> 0 이면 앞 N쌍만 (드라이버 점검용, 결과 blob 은 쓸모없다)")
+    ap.add_argument("--qf", action="store_true", help="학습/탐욕 탐색을 평가 경로 (서브픽셀 정수화 후 축소, fine_q) 로. 홀수는 fine_q, 짝수는 STE")
     ap.add_argument("--resume", action="store_true", help="--out + '.state.pt' 체크포인트에서 이어서 (컨테이너 재시작 대비, 10 에폭마다 저장)")
     args = ap.parse_args()
     from livevis import LiveVis
@@ -63,6 +64,8 @@ def main():
     cfg = parse_rcfg(args.renderer_cfg, n)
     t0 = time.time()
     odd, prev = renders(args.renderer, cfg, seg, pre, args.rbits, device=dev)
+    odd_in = fine_q(odd) if args.qf else odd  # PoseNet 에 들어가는 홀수 프레임 (prev 는 inflate 처럼 float 렌더)
+    evq = fine_q_ste if args.qf else (lambda x: x)
     blob = open(args.pose2, "rb").read()
     pos = archive.unpack_pose2(blob)
     B = pos["B"].clone().to(dev)
@@ -83,7 +86,7 @@ def main():
 
     def evaluate(a, c):
         with torch.inference_mode():
-            return torch.cat([pose_out(net, even_frames_prev(prev[b], a[j], c[j], B.detach()), odd[b]) for j, b in enumerate(batches)]) - target
+            return torch.cat([pose_out(net, evq(even_frames_prev(prev[b], a[j], c[j], B.detach())), odd_in[b]) for j, b in enumerate(batches)]) - target
 
     state_path = args.out + ".state.pt"
 
@@ -106,7 +109,7 @@ def main():
                 train_b = opt_B is not None and q is None and with_b
                 a, c = (A[j], C[j]) if q is None else q(A[j], C[j])
                 Bf = (fq_b(B) if args.b_qat else B) if train_b else B.detach()
-                out = pose_out(net, even_frames_prev(prev[b], a, c, Bf), odd[b])
+                out = pose_out(net, evq(even_frames_prev(prev[b], a, c, Bf)), odd_in[b])
                 sq = (out - target[b]) ** 2
                 loss = (sq * wdim).sum() if (q is None and weighted) else sq.sum()
                 opts[j].zero_grad()
