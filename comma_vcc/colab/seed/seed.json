@@ -1,7 +1,8 @@
 {
-  "renderer": "renderer_w24flip4c.pt (24,32,40, 4비트 QAT, flip 손실)",
-  "renderer_disagreement": 0.000378,
-  "pose": "pose2_v5d2.bin",
-  "posenet": 3.16e-06,
-  "score_cpu_eval": 0.1778
+  "renderer": "renderer_colab_c6.pt (24,32,40, 4비트 QAT, flip 손실, Colab 6사이클)",
+  "renderer_disagreement": 0.000274,
+  "pose": "pose2_v6.bin (계수 9비트)",
+  "posenet": 3.2e-06,
+  "ctx": "ctxnet_c24sc4.pt (5비트 QAT + self-compression ×4, cbits 5 로 빌드)",
+  "score_cpu_eval": 0.1638
 }
