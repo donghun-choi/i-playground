@@ -74,6 +74,8 @@ def fine_q(x: torch.Tensor) -> torch.Tensor:
     """
     from model import _table
 
+    if x.shape[0] > 16:  # 중간 텐서가 (P, n*3) int64 라서 나눠서
+        return torch.cat([fine_q(x[i : i + 16]) for i in range(0, x.shape[0], 16)])
     ss, _ = _table()
     ss = ss.to(x.device)
     n = x.shape[0]
