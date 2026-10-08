@@ -94,6 +94,12 @@ def dct_basis(k: int, bh: int, bw: int) -> torch.Tensor:
 # 헤더: arch(1 = v1 Renderer, 2 = RendererV2, 3 = 폭을 바꾼 v1, 4 = 폭을 바꾼 v1 + 프레임별 FiLM), v2 이면 width, fdim, n_frames, dilation 4개,
 # 3 이면 c1 c2 c3, 4 이면 c1 c2 c3 fdim n_frames
 def pack_renderer(cfg, weights: bytes) -> bytes:
+    """weights: pack_state 바이트 (xz 로 압축) 또는 wcodec 엔트로피 부호 (그대로, 헤더 코드 +10)."""
+    import wcodec
+
+    if wcodec.is_ec(weights):
+        assert cfg and len(cfg) in (3, 5)
+        return struct.pack(f"<B{len(cfg)}H", 13 if len(cfg) == 3 else 14, *cfg) + weights
     if not cfg:
         head = struct.pack("<B", 1)
     elif len(cfg) == 3:
@@ -114,6 +120,9 @@ def unpack_renderer(buf: bytes):
         return tuple(struct.unpack_from("<3H", buf, 1)), unxz(buf[struct.calcsize("<B3H"):])
     if buf[0] == 4:
         return tuple(struct.unpack_from("<5H", buf, 1)), unxz(buf[struct.calcsize("<B5H"):])
+    if buf[0] in (13, 14):  # wcodec 엔트로피 부호 (unpack_state 전에 wcodec.ec_unpack 으로 되돌린다)
+        nc = 3 if buf[0] == 13 else 5
+        return tuple(struct.unpack_from(f"<{nc}H", buf, 1)), buf[struct.calcsize(f"<B{nc}H"):]
     _, width, fdim, n_frames, *dils = struct.unpack_from("<BHBH4B", buf, 0)
     return (width, fdim, n_frames, tuple(dils)), unxz(buf[struct.calcsize("<BHBH4B"):])
 

@@ -21,6 +21,7 @@ sys.path.insert(0, str(HERE))
 
 import archive  # noqa: E402
 import segcodec  # noqa: E402
+import wcodec  # noqa: E402
 from model import even_frames, even_frames_prev, expand_fine, make_renderer, render, unpack_state  # noqa: E402
 
 
@@ -31,7 +32,7 @@ def log(msg):
 def reconstruct(p: bytes, batch: int = 8):
     """archive 바이트 → (even, odd) float32 (600,384,512,3) 두 배열 (평가 네트워크가 볼 값)."""
     sec = archive.unpack(p)
-    qnet, _ = segcodec.QNet.from_bytes(archive.unxz(sec["ctxn"]))
+    qnet, _ = segcodec.QNet.from_bytes(wcodec.ec_unpack_qnet(sec["ctxe"]) if "ctxe" in sec else archive.unxz(sec["ctxn"]))
     probe = np.random.default_rng(0).integers(0, segcodec.Q_IN + 1, (1, segcodec.C_IN, 48, 64))
     if not qnet.self_check(probe):
         log("float32 합성곱이 정확하지 않아 float64 로 디코드합니다 (느림)")
@@ -41,6 +42,8 @@ def reconstruct(p: bytes, batch: int = 8):
 
     cfg, wbytes = archive.unpack_renderer(sec["rend"])
     G = make_renderer(cfg)
+    if wcodec.is_ec(wbytes):
+        wbytes = wcodec.ec_unpack(wbytes, G.state_dict())
     G.load_state_dict(unpack_state(wbytes, G.state_dict()))
     G.eval()
     t = time.time()
