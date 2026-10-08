@@ -228,7 +228,7 @@ def main():
             dd.append(((pose_out(net, back[:, 0], back[:, 1]) - target[i : i + 20]) ** 2).mean(1))
     d2 = torch.cat(dd).mean().item()
     n3 = len(archive.pose2_to_pose3(out))
-    print(f"pose2 {len(out):,} B (pos3 {n3:,} B), 평가 경로 posenet_dist {d2:.7f} term {np.sqrt(10 * d2):.4f}"
+    print(f"pose2 {len(out):,} B (pos3 {n3:,} B), 평가 경로 posenet_dist {d2:.4e} term {np.sqrt(10 * d2):.4f}"
           f" → pose 관련 점수 {np.sqrt(10 * d2) + 25 * n3 / 37_545_489:.4f} ({time.time() - t0:.0f}s)", flush=True)
 
 

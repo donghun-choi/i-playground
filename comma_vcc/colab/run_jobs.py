@@ -174,7 +174,7 @@ def pose_job(args, s: dict) -> None:
     start = SEED / "pose2_seed.bin"
     common = ["--device", args.device, "--renderer", str(renderer), "--renderer-cfg", args.widths, "--rbits", str(rbits),
               "--cbits", str(args.pose_cbits), "--q-epochs", str(args.q_epochs), "--greedy-rounds", "1", "--qf", "--threads", "2", "--port", str(args.pose_port), *args.limit]
-    found = re.compile(r"평가 경로 posenet_dist ([0-9.]+)")
+    found = re.compile(r"평가 경로 posenet_dist ([0-9.eE+-]+)")
     ps = s.setdefault("pose", {})
     if ps.get("renderer") != renderer.name or ps.get("rbits") != rbits:  # 렌더러가 바뀌면 처음부터
         ps.clear()
