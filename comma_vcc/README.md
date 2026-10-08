@@ -35,10 +35,10 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6, 점수 0.1638)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.1, 점수 0.1608)
 
 ```
-archive (196KB) = 정수 문맥 CNN (14KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (123KB) + 렌더러 (31KB, 폭 24·32·40, 4비트) + pose (29KB, 계수 9비트 Rice 부호)
+archive (193KB) = 정수 문맥 CNN (14KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (123KB) + 렌더러 (31KB, 폭 24·32·40, 4비트) + pose (25KB, 기저 5비트, 계수 9비트 Rice 부호)
 
 seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본 짝수 프레임 0 의 맵 1장)
 홀수 프레임 i   = 렌더러(M_i)                                         → SegNet 이 M_i 를 내도록 학습
@@ -102,7 +102,9 @@ cd comma_vcc/lab
 ../.venv/bin/python ctxmodel.py --init ../cache/ctxnet_c24q5.pt --ch 24 --layers 5 --dils 1,2,4,2,1 --self-compress 4.0 --sc-init-bits 5 --steps 6000 --lr 5e-4 --threads 4 --out ../cache/ctxnet_c24sc4.pt
 # pose: 계수 격자 9비트 (10비트와 같은 pose 항에 -1.35KB)
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v5d2.bin --renderer ../cache/renderer_colab_c6.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 9 --epochs 200 --lr 0.01 --train-b 0.02 --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_v6.bin
-../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sc4.pt --cbits 5 --renderer ../cache/renderer_colab_c6.pt --renderer-cfg 24,32,40 --rbits 4 --pose2 ../cache/pose2_v6.bin
+# v6.1: 기저 B 를 5비트 격자로 가짜 양자화하며 다시 학습 (--bbits 5 --b-qat) → pose 항도 좋아지고 -3.6KB
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v6.bin --renderer ../cache/renderer_colab_c6.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 9 --epochs 150 --lr 0.005 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_v6_b5q.bin
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sc4.pt --cbits 5 --renderer ../cache/renderer_colab_c6.pt --renderer-cfg 24,32,40 --rbits 4 --pose2 ../cache/pose2_v6_b5q.bin
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -182,6 +184,9 @@ CPU 로는 렌더러 flip 학습 1에폭이 약 8분이라, 같은 레시피를 
   점수 공식 기준(×1) 크기 손실로는 비트가 거의 안 줄었다 — 작은 모델이라 줄일 채널이 별로 없다.
 - pose 계수 격자 10 → 9비트: 탐욕 ±1 탐색이 양자화 손해를 메워서 pose 항은 같고 -1.35KB.
   기저 B 를 학습 없이 5비트로 깎으면 pose 항 0.0038 → 0.054 (기저는 함께 학습해야 함).
+- (v6.1) pose 기저 B 5비트: 학습 없이 깎으면 pose 항 0.054 로 망가지지만, 기저를 5비트 격자로 가짜 양자화(STE)하며 150에폭 다시 학습하면
+  pose 항 0.0057 → 0.0050 으로 오히려 좋아지고 pose 섹션 -3.6KB. 기저 해상도를 12×16 으로 낮추는 것은 회전 차원 제어가 크게 무너져서 실패
+  (50에폭에서 1·2·5차원 0.018/0.012/0.009, 24×32 는 0.005/0.0085/0.0083).
 - 효과 없던 것: 패스별 확률 온도 보정 (-0.04%, 문맥 모델이 이미 잘 보정됨), 순수 엔트로피 부호 (xz 가 이미 0차 엔트로피 근처, 전체 -1.4KB).
 - pose 계수는 시간 상관이 없다 (차분 분산이 값 분산의 2배) → 차분 + xz 대신 (값 - 평균) 을 Rice 부호로: 14.7KB → 12.4KB (`pos3` 섹션).
 
@@ -224,3 +229,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v5d | 0.000378 | 0.0000035 | 0.00538 | **0.1780** | 렌더러 4비트 flip 10에폭 더, pose 200에폭 (기저를 계속 이어 학습할수록 회전 차원이 더 맞음). inflate 369s + 평가 228s |
 | semantic_cpu v5d2 | 0.000378 | 0.0000032 | 0.00538 | **0.1778** | v5d + pose 낮은 학습률 다듬기 40에폭 (`--epochs 40 --lr 0.001`, B 고정) |
 | semantic_cpu v6 | 0.000274 | 0.0000032 | 0.00523 | **0.1638** | 렌더러 Colab GPU 6사이클 (seg 0.0378 → 0.0274), 문맥 모델 5비트 QAT + self-compression (-4.3KB), pose 계수 9비트 (-1.35KB). inflate 402s + 평가 248s |
+| semantic_cpu v6.1 | 0.000274 | 0.0000026 | 0.00514 | **0.1608** | v6 + pose 기저 5비트 QAT 재학습 (pose 항 0.0057 → 0.0050, -3.6KB). inflate 430s |
