@@ -35,7 +35,7 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.1, 점수 0.1608)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.2, 점수 0.1569)
 
 ```
 archive (193KB) = 정수 문맥 CNN (14KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (123KB) + 렌더러 (31KB, 폭 24·32·40, 4비트) + pose (25KB, 기저 5비트, 계수 9비트 Rice 부호)
@@ -104,7 +104,11 @@ cd comma_vcc/lab
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v5d2.bin --renderer ../cache/renderer_colab_c6.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 9 --epochs 200 --lr 0.01 --train-b 0.02 --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_v6.bin
 # v6.1: 기저 B 를 5비트 격자로 가짜 양자화하며 다시 학습 (--bbits 5 --b-qat) → pose 항도 좋아지고 -3.6KB
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v6.bin --renderer ../cache/renderer_colab_c6.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 9 --epochs 150 --lr 0.005 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 1 --out ../cache/pose2_v6_b5q.bin
-../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sc4.pt --cbits 5 --renderer ../cache/renderer_colab_c6.pt --renderer-cfg 24,32,40 --rbits 4 --pose2 ../cache/pose2_v6_b5q.bin
+# v6.2: 렌더러 Colab 사이클 8 (renderer_best.pt → ../cache/renderer_colab_c8.pt) + pose 를 평가 경로(--qf)로 재피팅
+#   렌더러가 바뀌면 출력 색이 흘러가서 (c6 vs c8 평균 6.6레벨) pose 를 처음부터 다시 맞춰야 한다
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_v6_qf.bin --renderer ../cache/renderer_colab_c8.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 9 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 2 --qf --out ../cache/pose2_c8.bin
+#   (pose2_v6_qf.bin = pose2_v6_b5q.bin 에서 --epochs 0 --q-epochs 0 --keep-grid --qf --greedy-rounds 3, 렌더러 c6 기준 pose 항 0.0050 → 0.0025)
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sc4.pt --cbits 5 --renderer ../cache/renderer_colab_c8.pt --renderer-cfg 24,32,40 --rbits 4 --pose2 ../cache/pose2_c8.bin
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -187,6 +191,11 @@ CPU 로는 렌더러 flip 학습 1에폭이 약 8분이라, 같은 레시피를 
 - (v6.1) pose 기저 B 5비트: 학습 없이 깎으면 pose 항 0.054 로 망가지지만, 기저를 5비트 격자로 가짜 양자화(STE)하며 150에폭 다시 학습하면
   pose 항 0.0057 → 0.0050 으로 오히려 좋아지고 pose 섹션 -3.6KB. 기저 해상도를 12×16 으로 낮추는 것은 회전 차원 제어가 크게 무너져서 실패
   (50에폭에서 1·2·5차원 0.018/0.012/0.009, 24×32 는 0.005/0.0085/0.0083).
+- (v6.2) pose 를 평가 경로로 최적화 (`--qf`): 기록 단계(512x384 float → 2x2 서브픽셀 정수 → 평가의 bilinear 축소)가 값을 1/50 레벨 정도 바꾸는데,
+  탐욕 ±1 탐색이 float 경로에 과적합해서 학습 경로 d 6.8e-7 vs 실제 2.55e-6 (3.7배). 이 왕복을 원해상도를 만들지 않고 바로 계산하는 `fine_q`
+  (위치별 256 조합 가중합 표에서 가장 가까운 값, 평가와 1e-4 이내)를 학습(STE)과 탐욕 탐색에 넣으니 같은 계수 격자에서 2.55e-6 → 6e-7 (pose 항 0.0050 → 0.0025).
+  렌더러 c8 로 처음부터 다시 맞춘 것은 1.1e-6 (0.0034) 이지만 seg 항 -0.0024 가 더 커서 c8 을 쓴다.
+- pose 기저를 QAT 로 학습할 때 에폭별 평가가 float 기저를 써서 0번 차원이 엉뚱하게 크게 보였다 (실제 학습은 정상). 저장 격자 기저로 재도록 고침.
 - 효과 없던 것: 패스별 확률 온도 보정 (-0.04%, 문맥 모델이 이미 잘 보정됨), 순수 엔트로피 부호 (xz 가 이미 0차 엔트로피 근처, 전체 -1.4KB).
 - pose 계수는 시간 상관이 없다 (차분 분산이 값 분산의 2배) → 차분 + xz 대신 (값 - 평균) 을 Rice 부호로: 14.7KB → 12.4KB (`pos3` 섹션).
 
@@ -230,3 +239,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v5d2 | 0.000378 | 0.0000032 | 0.00538 | **0.1778** | v5d + pose 낮은 학습률 다듬기 40에폭 (`--epochs 40 --lr 0.001`, B 고정) |
 | semantic_cpu v6 | 0.000274 | 0.0000032 | 0.00523 | **0.1638** | 렌더러 Colab GPU 6사이클 (seg 0.0378 → 0.0274), 문맥 모델 5비트 QAT + self-compression (-4.3KB), pose 계수 9비트 (-1.35KB). inflate 402s + 평가 248s |
 | semantic_cpu v6.1 | 0.000274 | 0.0000026 | 0.00514 | **0.1608** | v6 + pose 기저 5비트 QAT 재학습 (pose 항 0.0057 → 0.0050, -3.6KB). inflate 430s |
+| semantic_cpu v6.2 | 0.000250 | 0.0000011 | 0.00514 | **0.1569** | 렌더러 Colab 사이클 8 (seg 0.0274 → 0.0250) + pose 를 평가 경로(서브픽셀 왕복, `--qf`)로 재피팅. inflate 419s |
