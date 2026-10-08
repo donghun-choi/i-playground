@@ -45,6 +45,7 @@ def main():
     ap.add_argument("--dimw", type=float, default=0.0, help="본 학습 손실의 차원별 가중 (1/분산)^dimw (양자화 단계는 일반 MSE)")
     ap.add_argument("--device", default="cpu", help="cpu | cuda (Colab GPU)")
     ap.add_argument("--limit", type=int, default=0, help="> 0 이면 앞 N쌍만 (드라이버 점검용, 결과 blob 은 쓸모없다)")
+    ap.add_argument("--keep-grid", action="store_true", help="입력 blob 의 격자 (c_step, a_step) 를 그대로 (이미 탐욕 탐색한 값에서 이어갈 때. 새 격자로 다시 반올림하면 최적점이 흐트러진다)")
     ap.add_argument("--qf", action="store_true", help="학습/탐욕 탐색을 평가 경로 (서브픽셀 정수화 후 축소, fine_q) 로. 홀수는 fine_q, 짝수는 STE")
     ap.add_argument("--resume", action="store_true", help="--out + '.state.pt' 체크포인트에서 이어서 (컨테이너 재시작 대비, 10 에폭마다 저장)")
     args = ap.parse_args()
@@ -163,6 +164,11 @@ def main():
         a_all, c_all = torch.cat([x.detach() for x in A]), torch.cat([x.detach() for x in C])
         a_step = (a_all.amax(0) - a_all.amin(0)).clamp_min(1e-6) * 1.2 / 2**args.cbits
         c_step = (c_all.amax(0) - c_all.amin(0)).clamp_min(1e-6) * 1.2 / 2**args.cbits
+        if args.keep_grid:
+            kk = pos["c"].shape[1]
+            hdr = archive.unxz(blob[archive.struct.calcsize("<HHBHH"):])
+            c_step = torch.from_numpy(np.frombuffer(hdr, np.float32, kk, 0).copy()).to(dev)
+            a_step = torch.from_numpy(np.frombuffer(hdr, np.float32, 6, 4 * kk).copy()).to(dev)
 
     def q(a, c):
         return a + ((a / a_step).round() * a_step - a).detach(), c + ((c / c_step).round() * c_step - c).detach()
