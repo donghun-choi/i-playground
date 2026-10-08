@@ -94,7 +94,8 @@ def main():
 
     def evaluate(a, c):
         with torch.inference_mode():
-            return torch.cat([pose_out(net, evq(even_frames_prev(prev[b], a[j], c[j], B.detach())), odd_in[b]) for j, b in enumerate(batches)]) - target
+            Be = fq_b(B.detach()) if (args.b_qat and B.requires_grad) else B.detach()  # 학습 중인 기저는 저장될 격자로 (float 로 재면 엉뚱한 값)
+            return torch.cat([pose_out(net, evq(even_frames_prev(prev[b], a[j], c[j], Be)), odd_in[b]) for j, b in enumerate(batches)]) - target
 
     state_path = args.out + ".state.pt"
 
