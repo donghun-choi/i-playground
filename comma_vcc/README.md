@@ -35,10 +35,10 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.5, 점수 0.1466)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.6, 점수 0.1427)
 
 ```
-archive (178KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (123KB) + 렌더러 (25KB, 폭 24·32·40, 채널별 학습 비트, 220/251 채널) + pose (17KB, 기저 8개 5비트, 계수 8비트 Rice 부호)
+archive (174KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (123KB) + 렌더러 (21KB, 폭 24·32·40, 채널별 학습 비트, 219/251 채널) + pose (17KB, 기저 8개 5비트, 계수 8비트 Rice 부호)
                (문맥 모델·렌더러 정수 가중치는 채널별 이산 라플라스 range coder, wcodec.py)
 
 seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본 짝수 프레임 0 의 맵 1장)
@@ -118,6 +118,12 @@ cd comma_vcc/lab
 ../.venv/bin/python renderer.py --widths 24,32,40 --resume ../cache/renderer_colab_c8.pt --epochs 10 --lr 3e-4 --bs 4 --cosine --fp32 --bits 4 --self-compress 1.0 --loss flip --full-eval --out ../cache/renderer_c8_sc.pt
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_c8_k8.bin --renderer ../cache/renderer_c8_sc.pt --renderer-cfg 24,32,40 --rbits 0 --cbits 8 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_sc_k8.bin
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sc4.pt --cbits 5 --renderer ../cache/renderer_c8_sc.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc_k8.bin --wec
+# v6.6: 렌더러·문맥 모델 self-compression 을 엔트로피 부호 크기 손실 (--sc-rate laplace) 로 한 사이클 더
+../.venv/bin/python renderer.py --widths 24,32,40 --resume ../cache/renderer_c8_sc.pt --epochs 10 --lr 3e-4 --bs 4 --cosine --fp32 --bits 4 --self-compress 1.0 --sc-rate laplace --loss flip --full-eval --out ../cache/renderer_c8_sc2.pt
+../.venv/bin/python ctxmodel.py --init ../cache/ctxnet_c24sc4.pt --ch 24 --layers 5 --dils 1,2,4,2,1 --self-compress 1.0 --sc-rate laplace --sc-init-bits 5 --steps 4000 --lr 5e-4 --out ../cache/ctxnet_c24scl.pt
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl.pt --cbits 5 --pose2 ../cache/pose2_sc_k8.bin --segs-only --wec   # → segs_pre.bin (이 문맥 모델과 짝)
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_sc_k8.bin --renderer ../cache/renderer_c8_sc2.pt --renderer-cfg 24,32,40 --rbits 0 --cbits 8 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_sc2_k8.bin
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl.pt --cbits 5 --renderer ../cache/renderer_c8_sc2.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc2_k8.bin --segs ../cache/segs_pre_scl.bin --wec
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -215,6 +221,10 @@ CPU 로는 렌더러 flip 학습 1에폭이 약 8분이라, 같은 레시피를 
   평균 2.71 비트. 600장 불일치 0.000250 → 0.000240 (같은 flip 사이클을 4비트 고정으로 돌린 것보다 오히려 낫다), 렌더러 29.6KB → 24.8KB (엔트로피 부호 기준).
   다만 크기 손실의 '비트 수' 는 정수 범위라서 실제 부호 크기와 잘 안 맞는다 (첫 에폭 3.37 비트인데 xz 는 -2.4% 뿐) → 다음엔 엔트로피 추정 손실 (`--sc-rate laplace`).
   렌더러가 바뀌면 pose 는 다시 맞춰야 하는데, 이번엔 기저 8개 재피팅이 오히려 더 잘 맞았다 (pose 항 0.0054 → 0.0038, 이어서 학습한 기저 덕).
+- (v6.6) self-compression 크기 손실을 실제 부호 크기 추정으로 (`--sc-rate laplace`): 채널마다 m = mean|q| 에서 이산 라플라스 ρ = m/(√(1+m²)+1),
+  H = -log2((1-ρ)/(1+ρ)) - m·log2 ρ (실제 wcodec 부호와 0.5% 이내). 가중치 1비트 = 점수 공식의 1비트로 그대로.
+  렌더러 한 사이클: 24.8KB → 21.3KB, 600장 불일치 0.000241 → 0.000231 (같이 좋아진다). 문맥 모델은 거의 안 줄어서 (+스트림) -0.5KB.
+  (처음엔 ρ = (√(1+m²)-1)/m 로 써서 잘린 채널(m→0)에서 float32 상쇄로 inf 가 났다.)
 - pose 기저를 QAT 로 학습할 때 에폭별 평가가 float 기저를 써서 0번 차원이 엉뚱하게 크게 보였다 (실제 학습은 정상). 저장 격자 기저로 재도록 고침.
 - 효과 없던 것: 패스별 확률 온도 보정 (-0.04%, 문맥 모델이 이미 잘 보정됨), 순수 엔트로피 부호 (xz 가 이미 0차 엔트로피 근처, 전체 -1.4KB).
 - pose 계수는 시간 상관이 없다 (차분 분산이 값 분산의 2배) → 차분 + xz 대신 (값 - 평균) 을 Rice 부호로: 14.7KB → 12.4KB (`pos3` 섹션).
@@ -263,3 +273,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v6.3 | 0.000250 | 0.0000029 | 0.00493 | **0.1536** | pose 계수 8비트 + 기저 12 → 8개 (pos3 25.0KB → 17.0KB, pose 항 0.0034 → 0.0054). inflate 403s |
 | semantic_cpu v6.4 | 0.000250 | 0.0000029 | 0.00488 | **0.1523** | 문맥 모델·렌더러 정수 가중치 엔트로피 부호 (wcodec, -2.0KB, 무손실) |
 | semantic_cpu v6.5 | 0.000241 | 0.0000015 | 0.00475 | **0.1466** | 렌더러 self-compression 사이클 (CPU, 29.6KB → 24.8KB, seg 0.0250 → 0.0241) + pose 재피팅 (항 0.0054 → 0.0038). inflate 400s |
+| semantic_cpu v6.6 | 0.000231 | 0.0000013 | 0.00464 | **0.1427** | self-compression 크기 손실을 엔트로피 부호 추정으로: 렌더러 21.3KB (seg 0.0231), 문맥 모델+스트림 -0.5KB, pose 재피팅. inflate 444s |
