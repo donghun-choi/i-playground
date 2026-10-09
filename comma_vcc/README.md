@@ -35,7 +35,7 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.10, 점수 0.1390)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.11, 점수 0.1389)
 
 ```
 archive (171KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (120KB) + 렌더러 (20KB, 폭 24·32·40, 채널별 학습 비트, 218/251 채널) + pose (17KB, 기저 8개 5비트, 계수 8비트 Rice 부호)
@@ -134,6 +134,8 @@ cd comma_vcc/lab
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl2.pt --cbits 5 --renderer ../cache/renderer_c8_sc4.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc4_k8.bin --segs ../cache/segs_pre_scl2.bin --wec
 # v6.10: 문맥 모델 한 라운드 더 (scl2 → scl3; 컨테이너 재시작으로 12000스텝에서 끊겨 그 체크포인트에서 10000스텝 lr 2e-4 로 이어감)
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl3.pt --cbits 5 --renderer ../cache/renderer_c8_sc4.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc4_k8.bin --segs ../cache/segs_pre_scl3.bin --wec
+# v6.11: 문맥 모델 라운드 4 (scl3 → scl4, 20000스텝 lr 2e-4) — 여기서 수렴 (-160 B)
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl4.pt --cbits 5 --renderer ../cache/renderer_c8_sc4.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc4_k8.bin --segs ../cache/segs_pre_scl4.bin --wec
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -237,6 +239,8 @@ CPU 로는 렌더러 flip 학습 1에폭이 약 8분이라, 같은 레시피를 
   (처음엔 ρ = (√(1+m²)-1)/m 로 써서 잘린 채널(m→0)에서 float32 상쇄로 inf 가 났다.)
 - 문맥 모델 c24 → c32 (함수 보존 확장 16000스텝 + self-compression): 스트림 122,744 → 121,572 B (-1.2KB) 지만 모델 13,048 → 15,454 B (+2.4KB),
   합 +1.2KB 손해이고 디코드도 1.8배 느려져서 c24 유지. 렌더러 self-compression 사이클 4 는 seg -0.0002, -129 B 로 수렴 (pose 재피팅 보류).
+- (v6.9~6.11) 문맥 모델은 낮은 학습률로 이어 학습할수록 계속 줄었다 (라운드당 20000스텝 약 40분): 135.8 → 134.5 → 133.5 → 133.3KB.
+  one-cycle 워밍업 때 잠깐 나빠졌다가 (10장 평가 +8 B/frame) 끝에서 회복. 네 번째 라운드에서 -160 B 로 수렴.
 - pose 기저를 QAT 로 학습할 때 에폭별 평가가 float 기저를 써서 0번 차원이 엉뚱하게 크게 보였다 (실제 학습은 정상). 저장 격자 기저로 재도록 고침.
 - 효과 없던 것: 패스별 확률 온도 보정 (-0.04%, 문맥 모델이 이미 잘 보정됨), 순수 엔트로피 부호 (xz 가 이미 0차 엔트로피 근처, 전체 -1.4KB).
 - pose 계수는 시간 상관이 없다 (차분 분산이 값 분산의 2배) → 차분 + xz 대신 (값 - 평균) 을 Rice 부호로: 14.7KB → 12.4KB (`pos3` 섹션).
@@ -291,3 +295,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v6.8 | 0.000220 | 0.0000010 | 0.00461 | **0.1405** | 렌더러 self-compression 사이클 4 (seg 0.0220, 20.5KB) + pose 재피팅 (항 0.0032, 지금까지 최저). inflate 391s |
 | semantic_cpu v6.9 | 0.000220 | 0.0000010 | 0.00458 | **0.1397** | 문맥 모델 20000스텝 더 (lr 3e-4): 모델+스트림 135,792 → 134,539 B. inflate 396s |
 | semantic_cpu v6.10 | 0.000220 | 0.0000010 | 0.00455 | **0.1390** | 문맥 모델 한 라운드 더: 모델+스트림 134,539 → 133,478 B (스트림 200 B/frame). inflate 406s |
+| semantic_cpu v6.11 | 0.000220 | 0.0000010 | 0.00455 | **0.1389** | 문맥 모델 라운드 4: 133,478 → 133,318 B (수렴). inflate 399s |
