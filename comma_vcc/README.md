@@ -35,7 +35,7 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.6, 점수 0.1427)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.7, 점수 0.1412)
 
 ```
 archive (174KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (123KB) + 렌더러 (21KB, 폭 24·32·40, 채널별 학습 비트, 219/251 채널) + pose (17KB, 기저 8개 5비트, 계수 8비트 Rice 부호)
@@ -124,6 +124,8 @@ cd comma_vcc/lab
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl.pt --cbits 5 --pose2 ../cache/pose2_sc_k8.bin --segs-only --wec   # → segs_pre.bin (이 문맥 모델과 짝)
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_sc_k8.bin --renderer ../cache/renderer_c8_sc2.pt --renderer-cfg 24,32,40 --rbits 0 --cbits 8 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_sc2_k8.bin
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl.pt --cbits 5 --renderer ../cache/renderer_c8_sc2.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc2_k8.bin --segs ../cache/segs_pre_scl.bin --wec
+# v6.7: 같은 렌더러 사이클 한 번 더 (renderer_c8_sc2 → sc3) + pose 재피팅 (pose2_sc2_k8 → sc3_k8, 같은 레시피)
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl.pt --cbits 5 --renderer ../cache/renderer_c8_sc3.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc3_k8.bin --segs ../cache/segs_pre_scl.bin --wec
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -274,3 +276,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v6.4 | 0.000250 | 0.0000029 | 0.00488 | **0.1523** | 문맥 모델·렌더러 정수 가중치 엔트로피 부호 (wcodec, -2.0KB, 무손실) |
 | semantic_cpu v6.5 | 0.000241 | 0.0000015 | 0.00475 | **0.1466** | 렌더러 self-compression 사이클 (CPU, 29.6KB → 24.8KB, seg 0.0250 → 0.0241) + pose 재피팅 (항 0.0054 → 0.0038). inflate 400s |
 | semantic_cpu v6.6 | 0.000231 | 0.0000013 | 0.00464 | **0.1427** | self-compression 크기 손실을 엔트로피 부호 추정으로: 렌더러 21.3KB (seg 0.0231), 문맥 모델+스트림 -0.5KB, pose 재피팅. inflate 444s |
+| semantic_cpu v6.7 | 0.000222 | 0.0000012 | 0.00462 | **0.1412** | 렌더러 self-compression 사이클 3 (20.6KB, seg 0.0222) + pose 재피팅 (항 0.0034). CPU 로 사이클 + 재피팅 약 4시간에 -0.0015. inflate 429s |
