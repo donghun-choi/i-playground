@@ -232,3 +232,36 @@ def unpack_pose3(buf: bytes):
         "c": torch.from_numpy((c_int * c_step.astype(np.float64)).astype(np.float32)),
         "a": torch.from_numpy((a_int * a_step.astype(np.float64)).astype(np.float32)),
     }
+
+
+# ---------------------------------------------------------------- pose v4: pose v3 와 같은 값, 기저 B 는 (기저, 채널) 행마다 라플라스 range coder
+def pose2_to_pose4(blob2: bytes) -> bytes:
+    """pose2 blob → pose4 blob (무손실 재포장): 헤더 + float32 (c_step, a_step, B_scale) + EC(B) + Rice(계수)."""
+    import wcodec
+
+    n, k, C, bh, bw = struct.unpack_from("<HHBHH", blob2, 0)
+    hl = struct.calcsize("<HHBHH")
+    body = unxz(blob2[hl:])
+    nf = 4 * (k + 6 + k)
+    B_q = np.frombuffer(body, np.int8, k * C * bh * bw, nf).reshape(k * C, bh * bw)
+    d = np.frombuffer(body, np.int16, (k + 6) * n, nf + k * C * bh * bw).reshape(k + 6, n)
+    vals = np.cumsum(d.astype(np.int64), axis=1)
+    return blob2[:hl] + body[:nf] + wcodec.ec_pack_rows(B_q) + rice_encode(vals)
+
+
+def unpack_pose4(buf: bytes):
+    import wcodec
+
+    n, k, C, bh, bw = struct.unpack_from("<HHBHH", buf, 0)
+    hl = struct.calcsize("<HHBHH")
+    c_step = np.frombuffer(buf, np.float32, k, hl)
+    a_step = np.frombuffer(buf, np.float32, 6, hl + 4 * k)
+    B_scale = np.frombuffer(buf, np.float32, k, hl + 4 * (k + 6))
+    B_q, off = wcodec.ec_unpack_rows(buf, k * C, bh * bw, hl + 4 * (2 * k + 6))
+    vals = rice_decode(buf[off:], k + 6, n)
+    c_int, a_int = vals[:k].T, vals[k:].T
+    return {
+        "B": torch.from_numpy(B_q.reshape(k, C, bh, bw).astype(np.float32) * B_scale.reshape(k, 1, 1, 1)),
+        "c": torch.from_numpy((c_int * c_step.astype(np.float64)).astype(np.float32)),
+        "a": torch.from_numpy((a_int * a_step.astype(np.float64)).astype(np.float32)),
+    }

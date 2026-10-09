@@ -48,7 +48,7 @@ def reconstruct(p: bytes, batch: int = 8):
     G.eval()
     t = time.time()
     with torch.inference_mode():
-        if "pos2" in sec or "pos3" in sec:
+        if "pos2" in sec or "pos3" in sec or "pos4" in sec:
             # seg 스트림 맨 앞 한 장은 첫 쌍의 '이전 프레임' 용 맵
             pre, seg = seg[:1], seg[1:]
             n = len(seg)
@@ -56,7 +56,8 @@ def reconstruct(p: bytes, batch: int = 8):
             for i in range(0, n, batch):
                 odd_t[i : i + batch] = render(G, torch.from_numpy(seg[i : i + batch]), torch.arange(i, min(i + batch, n)))
             prev0 = render(G, torch.from_numpy(pre), torch.zeros(1, dtype=torch.long))
-            pos = archive.unpack_pose3(sec["pos3"]) if "pos3" in sec else archive.unpack_pose2(sec["pos2"])
+            pos = (archive.unpack_pose4(sec["pos4"]) if "pos4" in sec else
+                   archive.unpack_pose3(sec["pos3"]) if "pos3" in sec else archive.unpack_pose2(sec["pos2"]))
             even = np.zeros((n, 384, 512, 3), np.float32)
             for i in range(0, n, batch):
                 prev = torch.cat([prev0, odd_t[: min(i + batch, n) - 1]]) if i == 0 else odd_t[i - 1 : min(i + batch, n) - 1]

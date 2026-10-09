@@ -173,3 +173,27 @@ def ec_unpack_qnet(buf: bytes) -> bytes:
         off += 8 * o
     assert off == len(raw)
     return b"".join(out)
+
+
+# ---------------------------------------------------------------- 정수 행렬 하나 (pose 기저 등)
+def ec_pack_rows(q: np.ndarray) -> bytes:
+    """(r, m) 정수 → [u8 qmax][r 바이트들][u32 단어 수][단어들]."""
+    import constriction
+
+    enc, fam = constriction.stream.queue.RangeEncoder(), constriction.stream.model.Categorical(perfect=False)
+    qmax, rs = _enc_rows(enc, fam, q.astype(np.int64))
+    words = enc.get_compressed()
+    return struct.pack("<B", qmax) + rs + struct.pack("<I", len(words)) + words.tobytes()
+
+
+def ec_unpack_rows(buf: bytes, r: int, m: int, off: int = 0):
+    """→ ((r, m) int64, 다음 오프셋)"""
+    import constriction
+
+    qmax = buf[off]
+    rs = buf[off + 1 : off + 1 + r]
+    (nw,) = struct.unpack_from("<I", buf, off + 1 + r)
+    w0 = off + 5 + r
+    dec = constriction.stream.queue.RangeDecoder(np.frombuffer(buf, np.uint32, nw, w0))
+    fam = constriction.stream.model.Categorical(perfect=False)
+    return _dec_rows(dec, fam, qmax, rs, m), w0 + 4 * nw
