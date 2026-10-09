@@ -5,5 +5,6 @@
   "posenet": 2.94e-06,
   "ctx": "ctxnet_c24sc4.pt (5비트 QAT + self-compression ×4, cbits 5 로 빌드)",
   "score_cpu_eval": 0.1523,
-  "archive": "build_archive --wec (가중치 엔트로피 부호)"
+  "archive": "build_archive --wec (가중치 엔트로피 부호)",
+  "note": "CPU 최고는 v6.5 (0.1466, 렌더러 self-compression renderer_c8_sc.pt + pose2_sc_k8.bin). 시드는 4비트 트랙용으로 c8 그대로"
 }
