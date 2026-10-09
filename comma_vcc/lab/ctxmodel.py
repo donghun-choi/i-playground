@@ -62,6 +62,23 @@ def load_ctx(path):
     return m, sd, dils
 
 
+@torch.no_grad()
+def widen_ctx(old: CtxNet, ch: int) -> CtxNet:
+    """폭을 ch 로 넓힌 CtxNet (처음엔 같은 출력): 새 채널은 작은 무작위 가중치, 다음 층에서 새 입력 채널 가중치는 0."""
+    new = CtxNet(ch, len(old.dils), old.dils)
+    convs_o = [m for m in old.net if isinstance(m, nn.Conv2d)]
+    convs_n = [m for m in new.net if isinstance(m, nn.Conv2d)]
+    for i, (co, cn) in enumerate(zip(convs_o, convs_n)):
+        o, c_in = co.weight.shape[:2]
+        cn.weight.mul_(0.1)
+        cn.bias.zero_()
+        if i > 0:
+            cn.weight[:, c_in:] = 0  # 새 입력 채널 (이전 층의 새 채널) 은 아직 안 쓴다
+        cn.weight[:o, :c_in] = co.weight
+        cn.bias[:o] = co.bias
+    return new
+
+
 def fq_weights(model, bits: int) -> dict:
     """conv 가중치를 bits 비트 격자로 (출력 채널별 max/qmax, segcodec.quantize_ctxnet 과 같은 규칙), STE."""
     qmax = 2 ** (bits - 1) - 1
@@ -105,6 +122,7 @@ def main():
     ap.add_argument("--eval-every", type=int, default=500)
     ap.add_argument("--out", default=str(CACHE / "ctxnet.pt"))
     ap.add_argument("--init", default=None)
+    ap.add_argument("--widen-from", default=None, help="이 체크포인트 (self-compression 이면 float 가중치) 를 --ch 폭으로 넓혀서 시작 (처음엔 같은 출력)")
     ap.add_argument("--dils", default=None, help="층별 dilation, 예: 1,2,4,2,1")
     ap.add_argument("--self-compress", type=float, default=0.0,
                     help="> 0 이면 채널별 비트 수를 학습 (selfcomp.py, 시작 --sc-init-bits). 1.0 = 가중치 1비트 ≈ 스트림 1비트")
@@ -123,6 +141,13 @@ def main():
     _, seg, _ = load_gt()
     dils = [int(d) for d in args.dils.split(",")] if args.dils else None
     model = CtxNet(args.ch, args.layers, dils)
+    if args.widen_from:
+        ckw = torch.load(args.widen_from)
+        sdw = ckw.get("float", ckw.get("sd", ckw))
+        old = CtxNet(sdw["net.0.weight"].shape[0], args.layers, ckw.get("dils", dils))
+        old.load_state_dict(sdw)
+        model = widen_ctx(old, args.ch)
+        print(f"폭 {old.net[0].weight.shape[0]} → {args.ch} 로 넓혀서 시작", flush=True)
     if args.init:
         ck = torch.load(args.init)
         model.load_state_dict(ck["sd"] if "sd" in ck else ck)
