@@ -35,10 +35,10 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.9, 점수 0.1397)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.10, 점수 0.1390)
 
 ```
-archive (172KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (122KB) + 렌더러 (20KB, 폭 24·32·40, 채널별 학습 비트, 218/251 채널) + pose (17KB, 기저 8개 5비트, 계수 8비트 Rice 부호)
+archive (171KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (120KB) + 렌더러 (20KB, 폭 24·32·40, 채널별 학습 비트, 218/251 채널) + pose (17KB, 기저 8개 5비트, 계수 8비트 Rice 부호)
                (문맥 모델·렌더러 정수 가중치는 채널별 이산 라플라스 range coder, wcodec.py)
 
 seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본 짝수 프레임 0 의 맵 1장)
@@ -132,6 +132,8 @@ cd comma_vcc/lab
 ../.venv/bin/python ctxmodel.py --init ../cache/ctxnet_c24scl.pt --ch 24 --layers 5 --dils 1,2,4,2,1 --self-compress 1.0 --sc-rate laplace --sc-init-bits 5 --steps 20000 --lr 3e-4 --threads 4 --out ../cache/ctxnet_c24scl2.pt
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl2.pt --cbits 5 --pose2 ../cache/pose2_sc4_k8.bin --segs-only --wec   # → segs_pre.bin (= segs_pre_scl2.bin)
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl2.pt --cbits 5 --renderer ../cache/renderer_c8_sc4.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc4_k8.bin --segs ../cache/segs_pre_scl2.bin --wec
+# v6.10: 문맥 모델 한 라운드 더 (scl2 → scl3; 컨테이너 재시작으로 12000스텝에서 끊겨 그 체크포인트에서 10000스텝 lr 2e-4 로 이어감)
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl3.pt --cbits 5 --renderer ../cache/renderer_c8_sc4.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc4_k8.bin --segs ../cache/segs_pre_scl3.bin --wec
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -288,3 +290,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v6.7b | 0.000222 | 0.0000012 | 0.00462 | **0.1410** | pose 섹션 pos4: 기저 B 를 (기저, 채널) 행별 라플라스 range coder 로 (17,008 → 16,734 B, 무손실) |
 | semantic_cpu v6.8 | 0.000220 | 0.0000010 | 0.00461 | **0.1405** | 렌더러 self-compression 사이클 4 (seg 0.0220, 20.5KB) + pose 재피팅 (항 0.0032, 지금까지 최저). inflate 391s |
 | semantic_cpu v6.9 | 0.000220 | 0.0000010 | 0.00458 | **0.1397** | 문맥 모델 20000스텝 더 (lr 3e-4): 모델+스트림 135,792 → 134,539 B. inflate 396s |
+| semantic_cpu v6.10 | 0.000220 | 0.0000010 | 0.00455 | **0.1390** | 문맥 모델 한 라운드 더: 모델+스트림 134,539 → 133,478 B (스트림 200 B/frame). inflate 406s |
