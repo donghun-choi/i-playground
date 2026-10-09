@@ -110,6 +110,8 @@ def main():
                     help="> 0 이면 채널별 비트 수를 학습 (selfcomp.py, 시작 --sc-init-bits). 1.0 = 가중치 1비트 ≈ 스트림 1비트")
     ap.add_argument("--sc-init-bits", type=float, default=6.0)
     ap.add_argument("--sc-lr", type=float, default=1e-2)
+    ap.add_argument("--sc-rate", default="range", choices=("range", "laplace"),
+                    help="크기 손실: range = 채널별 비트 수 / laplace = 엔트로피 부호 (wcodec) 비트 추정. --init 에 self-compression 상태가 있으면 이어서")
     ap.add_argument("--qat-bits", type=int, default=0, help="> 0 이면 가중치를 이 비트 격자로 가짜 양자화해서 학습 (quantize_ctxnet 과 같은 출력 채널별 스케일)")
     args = ap.parse_args()
 
@@ -131,8 +133,13 @@ def main():
         from selfcomp import SelfCompress
 
         sc = SelfCompress(model, args.sc_init_bits)
+        if args.init and "sc" in ck and "float" in ck:  # self-compression 이어서: float 가중치 + 비트/스케일
+            model.load_state_dict(ck["float"])
+            sc.load_state_dict(ck["sc"])
         # 손실 = 대상 칸당 nats. 스트림 전체 비트 ≈ 손실/ln2 × 부호화 칸 수 (601장 × 384·512) → 가중치 1비트와 같은 값으로
         gamma = args.self_compress * 0.75 * sc.total / (601 * SH * SW / math.log(2))
+        if args.sc_rate == "laplace":
+            gamma = args.self_compress / (601 * SH * SW / math.log(2))
         groups.append({"params": list(sc.parameters()), "lr": args.sc_lr})
         print(f"self-compression: γ {gamma:.3g}, {sc.summary()}", flush=True)
     opt = torch.optim.Adam(groups)
@@ -172,7 +179,7 @@ def main():
         nll = F.cross_entropy(logits, g, reduction="none")[tmask]
         loss = nll.mean()
         if sc is not None:
-            loss = loss + gamma * sc.bits_per_weight()
+            loss = loss + gamma * (sc.rate_bits(model) if args.sc_rate == "laplace" else sc.bits_per_weight())
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -196,7 +203,9 @@ def main():
             print(f"step {step}: {bpf:.0f} B/frame (coarse 제외) ({time.time() - t0:.0f}s) "
                   + " ".join(f"{k}:{v / 8 / len(eval_frames):.0f}" for k, v in tot.items()), flush=True)
             if sc is not None:
-                print(f"   {sc.summary()}", flush=True)
+                with torch.no_grad():
+                    est = sc.rate_bits(model).item() / 8
+                print(f"   {sc.summary()}, 가중치 엔트로피 추정 {est:,.0f} B", flush=True)
                 viz.log(step, bits_per_weight=sc.bits_per_weight().item())
                 torch.save({"sd": emodel.state_dict(), "dils": model.dils, "wq": wq,
                             "float": model.state_dict(), "sc": sc.state_dict()}, args.out)
