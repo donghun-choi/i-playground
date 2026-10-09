@@ -78,7 +78,7 @@ class SelfCompress(nn.Module):
         for k in self.names:
             q, _ = self._q(k, params[k])
             m = q.abs().reshape(q.shape[0], -1).mean(1).clamp_min(1e-4)
-            rho = (torch.sqrt(1 + m * m) - 1) / m
+            rho = m / (torch.sqrt(1 + m * m) + 1)  # = (√(1+m²)-1)/m, 작은 m 에서 상쇄 없이
             H = -torch.log2((1 - rho) / (1 + rho)) - m * torch.log2(rho)
             tot = tot + (H * self.n_per_ch[k]).sum()
         return tot
