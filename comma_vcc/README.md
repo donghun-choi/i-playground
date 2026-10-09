@@ -35,10 +35,11 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.3, 점수 0.1536)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.4, 점수 0.1523)
 
 ```
-archive (185KB) = 정수 문맥 CNN (14KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (123KB) + 렌더러 (31KB, 폭 24·32·40, 4비트) + pose (17KB, 기저 8개 5비트, 계수 8비트 Rice 부호)
+archive (183KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (123KB) + 렌더러 (30KB, 폭 24·32·40, 4비트) + pose (17KB, 기저 8개 5비트, 계수 8비트 Rice 부호)
+               (문맥 모델·렌더러 정수 가중치는 채널별 이산 라플라스 range coder, wcodec.py)
 
 seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본 짝수 프레임 0 의 맵 1장)
 홀수 프레임 i   = 렌더러(M_i)                                         → SegNet 이 M_i 를 내도록 학습
@@ -111,7 +112,8 @@ cd comma_vcc/lab
 # v6.3: pose 바이트 줄이기 (평가 경로 탐욕 탐색이 격자 손해를 메운다) - 계수 격자 8비트, 기저 12 → 8개
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_c8.bin --renderer ../cache/renderer_colab_c8.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 8 --bbits 5 --epochs 0 --lr 0.01 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_c8_cb8.bin
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_c8_cb8.bin --renderer ../cache/renderer_colab_c8.pt --renderer-cfg 24,32,40 --rbits 4 --cbits 8 --keep-k 8 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_c8_k8.bin
-../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sc4.pt --cbits 5 --renderer ../cache/renderer_colab_c8.pt --renderer-cfg 24,32,40 --rbits 4 --pose2 ../cache/pose2_c8_k8.bin
+# v6.4: 정수 가중치 엔트로피 부호 (--wec)
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sc4.pt --cbits 5 --renderer ../cache/renderer_colab_c8.pt --renderer-cfg 24,32,40 --rbits 4 --pose2 ../cache/pose2_c8_k8.bin --wec
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -202,6 +204,9 @@ CPU 로는 렌더러 flip 학습 1에폭이 약 8분이라, 같은 레시피를 
   √10/(2√d) ≈ 1500 이라 1KB 를 아끼면 d 가 40% 나빠져도 본전. pose 항 + pos3 rate 로 비교:
   계수 격자 9비트 0.01996 → 8비트 0.01906 (d 그대로, -1.36KB) → 7비트 0.01898 (d 1.7e-6, -1.33KB 더; 8비트와 사실상 같아서 8비트).
   기저 12 → 8개 (계수 에너지 × 기저 크기로 고르고 150에폭 다시): 회전 차원은 3배 나빠지지만 (d 2.9e-6, 항 0.0054) pos3 23.6KB → 17.0KB 라 0.0167.
+- (v6.4) 정수 가중치를 xz 대신 엔트로피 부호로 (`wcodec.py`): 4비트 렌더러 가중치의 0차 엔트로피는 2.82 비트인데 xz 는 약 3 비트.
+  출력 채널마다 이산 라플라스 P(q) ∝ r^|q| (r = 1..255/256, 1바이트) 를 골라 range coder 로 (빈도는 정수 연산만 → 기계와 무관).
+  렌더러 31,178 → 29,607 B, 문맥 모델 13,617 → 13,203 B. 텐서별 경험 분포 + 표 (29.0KB) 나 가우시안 (28.7KB + α) 보다 채널별 라플라스가 낫다.
 - pose 기저를 QAT 로 학습할 때 에폭별 평가가 float 기저를 써서 0번 차원이 엉뚱하게 크게 보였다 (실제 학습은 정상). 저장 격자 기저로 재도록 고침.
 - 효과 없던 것: 패스별 확률 온도 보정 (-0.04%, 문맥 모델이 이미 잘 보정됨), 순수 엔트로피 부호 (xz 가 이미 0차 엔트로피 근처, 전체 -1.4KB).
 - pose 계수는 시간 상관이 없다 (차분 분산이 값 분산의 2배) → 차분 + xz 대신 (값 - 평균) 을 Rice 부호로: 14.7KB → 12.4KB (`pos3` 섹션).
@@ -248,3 +253,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v6.1 | 0.000274 | 0.0000026 | 0.00514 | **0.1608** | v6 + pose 기저 5비트 QAT 재학습 (pose 항 0.0057 → 0.0050, -3.6KB). inflate 430s |
 | semantic_cpu v6.2 | 0.000250 | 0.0000011 | 0.00514 | **0.1569** | 렌더러 Colab 사이클 8 (seg 0.0274 → 0.0250) + pose 를 평가 경로(서브픽셀 왕복, `--qf`)로 재피팅. inflate 419s |
 | semantic_cpu v6.3 | 0.000250 | 0.0000029 | 0.00493 | **0.1536** | pose 계수 8비트 + 기저 12 → 8개 (pos3 25.0KB → 17.0KB, pose 항 0.0034 → 0.0054). inflate 403s |
+| semantic_cpu v6.4 | 0.000250 | 0.0000029 | 0.00488 | **0.1523** | 문맥 모델·렌더러 정수 가중치 엔트로피 부호 (wcodec, -2.0KB, 무손실) |
