@@ -67,6 +67,22 @@ class SelfCompress(nn.Module):
             tot = tot + torch.relu(self.b[k.replace(".", "__")]).sum() * self.n_per_ch[k]
         return tot / self.total
 
+    def rate_bits(self, model: nn.Module) -> torch.Tensor:
+        """엔트로피 부호 크기 (wcodec: 출력 채널마다 이산 라플라스) 의 미분 가능한 추정, 비트 단위.
+
+        채널마다 m = mean|q| → 양쪽 기하분포 P(q) = (1-ρ)/(1+ρ) ρ^|q| 의 ρ = (√(1+m²)-1)/m,  H = -log2 P(0) - m log2 ρ.
+        (c8 렌더러에서 28,501 B vs 실제 부호 28,364 B). |q| 는 STE 라서 W 를 0 쪽으로, 스케일을 크게 미는 기울기가 흐른다.
+        """
+        params = dict(model.named_parameters())
+        tot = 0.0
+        for k in self.names:
+            q, _ = self._q(k, params[k])
+            m = q.abs().reshape(q.shape[0], -1).mean(1).clamp_min(1e-4)
+            rho = (torch.sqrt(1 + m * m) - 1) / m
+            H = -torch.log2((1 - rho) / (1 + rho)) - m * torch.log2(rho)
+            tot = tot + (H * self.n_per_ch[k]).sum()
+        return tot
+
     @torch.no_grad()
     def export(self, model: nn.Module):
         """→ (역양자화 float state_dict = inflate 와 같은 값, pack 바이트). 정수가 int8 범위를 넘지 않게 자른다."""

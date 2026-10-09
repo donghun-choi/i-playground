@@ -79,6 +79,8 @@ def main():
     ap.add_argument("--self-compress", type=float, default=0.0,
                     help="> 0 이면 채널별 비트 수를 학습 (selfcomp.py). 1.0 = 점수 공식에 맞춘 크기/불일치 trade-off (--bits 는 시작 비트)")
     ap.add_argument("--sc-lr", type=float, default=1e-2, help="self-compression 의 비트/스케일 학습률")
+    ap.add_argument("--sc-rate", default="range", choices=("range", "laplace"),
+                    help="크기 손실: range = 채널별 비트 수 (원 논문) / laplace = 엔트로피 부호 (wcodec) 비트 추정 (selfcomp.rate_bits)")
     ap.add_argument("--bs", type=int, default=4)
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--threads", type=int, default=4)
@@ -144,6 +146,8 @@ def main():
             sc = SelfCompress(G, float(args.bits)).to(dev)
         # 점수 = 100·불일치 + 25·바이트/원본 → 손실(≈불일치) 단위로 가중치당 1비트의 값 (xz 가 비트 수의 약 0.75 로 줄인다)
         gamma = args.self_compress * 0.75 * 25 * sc.total / 8 / 37_545_489 / 100
+        if args.sc_rate == "laplace":  # 손실(≈불일치) 단위로 1비트의 값: 25/8/원본/100
+            gamma = args.self_compress * 25 / 8 / 37_545_489 / 100
         groups.append({"params": list(sc.parameters()), "lr": args.sc_lr})
         print(f"self-compression: γ {gamma:.3g} (가중치 {sc.total:,}), {sc.summary()}", flush=True)
     opt = torch.optim.Adam(groups)
@@ -188,7 +192,7 @@ def main():
                 # argmax 를 뒤집는 데 직접 관여하는 margin 손실: 정답 logit 이 다른 것보다 2 이상 크게
                 loss = F.cross_entropy(logits, m) + F.relu(2.0 - margin).mean()
             if sc is not None:
-                loss = loss + gamma * sc.bits_per_weight()
+                loss = loss + gamma * (sc.rate_bits(G) if args.sc_rate == "laplace" else sc.bits_per_weight())
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -206,9 +210,14 @@ def main():
             sd_exp, packed = sc.export(G)
             import archive
 
+            import wcodec
+
             nbytes = len(archive.pack_renderer(G.cfg, packed))
-            viz.log(step, renderer_bytes=nbytes, bits_per_weight=sc.bits_per_weight().item())
-            print(f"   self-compression: 렌더러 {nbytes:,} B, {sc.summary()}", flush=True)
+            nbytes_ec = len(archive.pack_renderer(G.cfg, wcodec.ec_pack(packed, G.state_dict())))
+            with torch.no_grad():
+                est = sc.rate_bits(G).item() / 8
+            viz.log(step, renderer_bytes=nbytes, renderer_bytes_ec=nbytes_ec, bits_per_weight=sc.bits_per_weight().item())
+            print(f"   self-compression: 렌더러 {nbytes:,} B (엔트로피 부호 {nbytes_ec:,} B, 추정 {est:,.0f} B), {sc.summary()}", flush=True)
         errs = evaluate(G, net, seg, val_idx, bits=args.bits, bs=16 if dev.type == "cuda" else 8, sd=sd_exp)
         viz.log(step, val_disagreement_fp32=errs.mean().item(), val_seg_term=100 * errs.mean().item())
         with torch.inference_mode():
