@@ -81,6 +81,29 @@ def widen_ctx(old: CtxNet, ch: int) -> CtxNet:
     return new
 
 
+@torch.no_grad()
+def deepen_ctx(old: CtxNet, dils) -> CtxNet:
+    """old 의 dilation 목록에 층을 끼워 넣은 CtxNet (처음엔 같은 출력): 새 층은 항등 (가운데 탭 1, ReLU 뒤라 값이 그대로)."""
+    new = CtxNet(old.net[0].weight.shape[0], len(dils), dils, old.c_in)
+    convs_o = [m for m in old.net if isinstance(m, nn.Conv2d)]
+    convs_n = [m for m in new.net if isinstance(m, nn.Conv2d)]
+    j = 0
+    for i, cn in enumerate(convs_n[:-1]):
+        if j < len(old.dils) and dils[i] == old.dils[j]:
+            cn.weight.copy_(convs_o[j].weight)
+            cn.bias.copy_(convs_o[j].bias)
+            j += 1
+        else:
+            cn.weight.zero_()
+            cn.bias.zero_()
+            for c in range(cn.weight.shape[0]):
+                cn.weight[c, c, 1, 1] = 1.0
+    assert j == len(old.dils), "기존 dilation 이 순서대로 들어 있어야 한다"
+    convs_n[-1].weight.copy_(convs_o[-1].weight)
+    convs_n[-1].bias.copy_(convs_o[-1].bias)
+    return new
+
+
 def fq_weights(model, bits: int) -> dict:
     """conv 가중치를 bits 비트 격자로 (출력 채널별 max/qmax, segcodec.quantize_ctxnet 과 같은 규칙), STE."""
     qmax = 2 ** (bits - 1) - 1
@@ -135,6 +158,7 @@ def main():
     ap.add_argument("--init", default=None)
     ap.add_argument("--widen-from", default=None, help="이 체크포인트 (self-compression 이면 float 가중치) 를 --ch 폭으로 넓혀서 시작 (처음엔 같은 출력)")
     ap.add_argument("--dils", default=None, help="층별 dilation, 예: 1,2,4,2,1")
+    ap.add_argument("--deepen-from", default=None, help="이 체크포인트 (self-compression 이면 float 가중치) 에 --dils 대로 항등 층을 끼워 시작")
     ap.add_argument("--split-a", action="store_true", help="A 패스를 체커보드로 A1·A2 로 나눈 23채널 모델 (--init 이 22채널이면 새 입력 채널 0 으로 이어서)")
     ap.add_argument("--split-a1", action="store_true", help="--split-a 에 더해 A1 도 A11·A12 로 나눈 24채널 모델")
     ap.add_argument("--self-compress", type=float, default=0.0,
@@ -165,6 +189,13 @@ def main():
         old.load_state_dict(sdw)
         model = widen_ctx(old, args.ch)
         print(f"폭 {old.net[0].weight.shape[0]} → {args.ch} 로 넓혀서 시작", flush=True)
+    if args.deepen_from:
+        ckd = torch.load(args.deepen_from)
+        sdd = pad_input(ckd.get("float", ckd.get("sd", ckd)), c_in)
+        old = CtxNet(sdd["net.0.weight"].shape[0], len(ckd["dils"]), ckd["dils"], c_in)
+        old.load_state_dict(sdd)
+        model = deepen_ctx(old, dils)
+        print(f"dilation {old.dils} → {dils} 로 깊게 해서 시작", flush=True)
     if args.init:
         ck = torch.load(args.init)
         model.load_state_dict(pad_input(ck["sd"] if "sd" in ck else ck, c_in))
