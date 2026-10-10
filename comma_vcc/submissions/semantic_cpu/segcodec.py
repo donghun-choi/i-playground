@@ -1,7 +1,7 @@
 """seg 맵 무손실 코덱 (제출물에 그대로 들어가는 자체 완결 모듈: numpy, torch, constriction 만 사용).
 
 순서: 프레임마다 stride-32 격자(coarse) → 레벨 s=32..2 에서 A 패스, B 패스.
-      입력 23채널 모델은 A 를 체커보드로 A1 → A2 로 나눈다. 24채널은 B 도 B1 → B2 로 (PASSES).
+      입력 23채널 모델은 A 를 체커보드로 A1 → A2 로 나눈다. 24채널은 A1 도 둘로 (PASSES).
 확률: coarse 는 적응형 정수 카운트, 나머지는 정수 CNN (float64 로 계산하지만 값이 전부 정수라 결과가 기계와 무관).
 
 정수 CNN 규약
@@ -25,9 +25,9 @@ LEVELS = [32, 16, 8, 4, 2]
 K = 5
 C_IN = 22
 # 입력 채널 수 → 레벨마다 패스 순서와 추가 입력 채널 (그 패스일 때 64). 23: A 를 체커보드로 A1 → A2 (A2 는 A1 을 안다).
-# 24: B 도 B1 (홀수 행) → B2 (홀수 열) 로 (B2 는 대각 이웃까지 안다 — 비트는 거의 그대로였다).
-PASSES = {22: ("A", "B"), 23: ("A1", "A2", "B"), 24: ("A1", "A2", "B1", "B2")}
-EXTRA = {22: (), 23: ("A2",), 24: ("B2", "A2")}
+# 24: A1 을 다시 둘로 (A11 → A12). (B 를 B1 → B2 로 나누는 것은 비트가 그대로라 뺐다.)
+PASSES = {22: ("A", "B"), 23: ("A1", "A2", "B"), 24: ("A11", "A12", "A2", "B")}
+EXTRA = {22: (), 23: ("A2",), 24: ("A2", "A12")}
 Q_IN = 64  # 입력 스케일
 LOGIT_UNIT = 16  # logit 1 nat = 16
 SHIFT = 16
@@ -55,17 +55,16 @@ def masks(h: int, kind: str):
     gj = (np.arange(SW // h) % 2)[None, :]
     if kind == "A":
         known, target = (gi == 0) & (gj == 0), (gi == 1) & (gj == 1)
-    elif kind in ("A1", "A2"):
-        a = (gi == 1) & (gj == 1)
-        chk = ((np.arange(SH // h) // 2) % 2)[:, None] ^ ((np.arange(SW // h) // 2) % 2)[None, :]
-        a1 = a & (chk == 0)
-        known, target = ((gi == 0) & (gj == 0), a1) if kind == "A1" else (((gi == 0) & (gj == 0)) | a1, a & (chk == 1))
     elif kind == "B":
         known, target = gi == gj, gi != gj
-    elif kind == "B1":
-        known, target = gi == gj, (gi == 1) & (gj == 0)
-    else:  # B2
-        known, target = (gi == gj) | ((gi == 1) & (gj == 0)), (gi == 0) & (gj == 1)
+    else:  # A1 / A2 / A11 / A12: A 칸 (홀,홀) 을 체커보드로 A1 → A2, A1 은 다시 (4i+1,4j+1) → (4i+3,4j+3)
+        base = (gi == 0) & (gj == 0)
+        a = (gi == 1) & (gj == 1)
+        ri, rj = (np.arange(SH // h) % 4)[:, None], (np.arange(SW // h) % 4)[None, :]
+        a11, a12 = (ri == 1) & (rj == 1), (ri == 3) & (rj == 3)
+        a1 = a11 | a12
+        known, target = {"A1": (base, a1), "A2": (base | a1, a & ~a1),
+                         "A11": (base, a11), "A12": (base | a11, a12)}[kind]
     return known, target
 
 

@@ -136,7 +136,7 @@ def main():
     ap.add_argument("--widen-from", default=None, help="이 체크포인트 (self-compression 이면 float 가중치) 를 --ch 폭으로 넓혀서 시작 (처음엔 같은 출력)")
     ap.add_argument("--dils", default=None, help="층별 dilation, 예: 1,2,4,2,1")
     ap.add_argument("--split-a", action="store_true", help="A 패스를 체커보드로 A1·A2 로 나눈 23채널 모델 (--init 이 22채널이면 새 입력 채널 0 으로 이어서)")
-    ap.add_argument("--split-b", action="store_true", help="--split-a 에 더해 B 도 B1·B2 로 나눈 24채널 모델")
+    ap.add_argument("--split-a1", action="store_true", help="--split-a 에 더해 A1 도 A11·A12 로 나눈 24채널 모델")
     ap.add_argument("--self-compress", type=float, default=0.0,
                     help="> 0 이면 채널별 비트 수를 학습 (selfcomp.py, 시작 --sc-init-bits). 1.0 = 가중치 1비트 ≈ 스트림 1비트")
     ap.add_argument("--sc-init-bits", type=float, default=6.0)
@@ -153,8 +153,8 @@ def main():
     rng = np.random.default_rng(0)
     _, seg, _ = load_gt()
     dils = [int(d) for d in args.dils.split(",")] if args.dils else None
-    assert args.split_a or not args.split_b, "--split-b 는 --split-a 와 함께"
-    c_in = 24 if args.split_b else 23 if args.split_a else C_IN
+    assert args.split_a or not args.split_a1, "--split-a1 은 --split-a 와 함께"
+    c_in = 24 if args.split_a1 else 23 if args.split_a else C_IN
     align = 4 if c_in > C_IN else 2  # 크롭 시작: 패스 패턴의 주기
     passes = PASSES[c_in]
     model = CtxNet(args.ch, args.layers, dils, c_in)
