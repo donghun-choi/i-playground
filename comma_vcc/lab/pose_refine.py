@@ -45,6 +45,7 @@ def main():
     ap.add_argument("--dimw", type=float, default=0.0, help="본 학습 손실의 차원별 가중 (1/분산)^dimw (양자화 단계는 일반 MSE)")
     ap.add_argument("--device", default="cpu", help="cpu | cuda (Colab GPU)")
     ap.add_argument("--limit", type=int, default=0, help="> 0 이면 앞 N쌍만 (드라이버 점검용, 결과 blob 은 쓸모없다)")
+    ap.add_argument("--b-gray", action="store_true", help="기저를 1채널(회색 = 밝기만, RGB 에 같은 값)로: Y 가중 평균에서 시작. --train-b 로 다시 맞춘다 (기저 크기 1/3)")
     ap.add_argument("--keep-k", type=int, default=0, help="> 0 이면 기저를 이 개수만 남긴다 (계수 에너지 × 기저 크기 순). --train-b 로 다시 맞춘다")
     ap.add_argument("--keep-grid", action="store_true", help="입력 blob 의 격자 (c_step, a_step) 를 그대로 (이미 탐욕 탐색한 값에서 이어갈 때. 새 격자로 다시 반올림하면 최적점이 흐트러진다)")
     ap.add_argument("--qf", action="store_true", help="학습/탐욕 탐색을 평가 경로 (서브픽셀 정수화 후 축소, fine_q) 로. 홀수는 fine_q, 짝수는 STE")
@@ -76,6 +77,11 @@ def main():
         keep = imp.argsort(descending=True)[: args.keep_k].sort().values
         print(f"기저 {len(imp)} → {args.keep_k} 개 (중요도 {imp.numpy().round(1)}, 남김 {keep.tolist()})", flush=True)
         pos = {"B": pos["B"][keep], "c": pos["c"][:, keep], "a": pos["a"]}
+    if args.b_gray:
+        assert args.train_b > 0 and not args.keep_grid, "--b-gray 는 기저를 다시 저장해야 한다 (--train-b)"
+        if pos["B"].shape[1] == 3:
+            pos["B"] = (pos["B"] * torch.tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)).sum(1, keepdim=True)
+            print("기저 RGB → 회색 1채널 (Y 가중)", flush=True)
     B = pos["B"].clone().to(dev)
     if args.b_res:
         assert args.train_b > 0, "--b-res 는 기저를 다시 학습해야 한다 (--train-b)"

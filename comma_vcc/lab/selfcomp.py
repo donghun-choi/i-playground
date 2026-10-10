@@ -31,7 +31,7 @@ class SelfCompress(nn.Module):
         for k in self.names:
             W = params[k].detach()
             m0 = 2 ** (init_bits - 1) - 1
-            amax = W.abs().reshape(W.shape[0], -1).amax(1).clamp_min(1e-8)
+            amax = W.abs().reshape(W.shape[0], -1).amax(1).clamp_min(1e-3)  # 잘린 채널 (전부 0) 도 쓸 수 있는 스케일로 (아니면 fp16 에서 0 → 0/0)
             key = k.replace(".", "__")
             self.e[key] = nn.Parameter(torch.log2(amax / m0))
             self.b[key] = nn.Parameter(torch.full((W.shape[0],), float(init_bits), device=W.device))
@@ -43,7 +43,7 @@ class SelfCompress(nn.Module):
         e, b = self.e[key], self.b[key]
         shape = (-1,) + (1,) * (W.ndim - 1)
         s = 2.0 ** e
-        s = s + (s.half().float() - s).detach()  # 저장되는 fp16 값으로
+        s = s + (s.half().float().clamp_min(2**-14) - s).detach()  # 저장되는 fp16 값으로 (정상 범위 안)
         m = torch.relu(2.0 ** (b - 1) - 1).view(shape)
         x = W / s.view(shape)
         q = _ste_round(torch.maximum(torch.minimum(x, m), -m))
