@@ -27,21 +27,22 @@ K = sc.K
 C_IN = sc.C_IN
 
 
-def build_input(cur, prev, prev2, s: int, kind: str):
+def build_input(cur, prev, prev2, s: int, kind: str, c_in: int = C_IN):
     """디코더와 같은 정수 입력 (segcodec.build_input_q) 을 float (0..1) 로. cur/prev/prev2: (n,384,512) uint8 numpy."""
     h = s // 2
-    x = torch.from_numpy(sc.build_input_q(cur, prev, prev2, s, kind)).float() / sc.Q_IN
+    x = torch.from_numpy(sc.build_input_q(cur, prev, prev2, s, kind, c_in)).float() / sc.Q_IN
     _, target = sc.masks(h, kind)
     return x, torch.from_numpy(target), torch.from_numpy(cur[:, ::h, ::h].astype(np.int64))
 
 
 class CtxNet(nn.Module):
-    def __init__(self, ch: int = 16, layers: int = 4, dils=None):
+    def __init__(self, ch: int = 16, layers: int = 4, dils=None, c_in: int = C_IN):
         super().__init__()
         dils = list(dils) if dils else [1] * layers
         assert len(dils) == layers
         self.dils = dils
-        mods = [nn.Conv2d(C_IN, ch, 3, padding=dils[0], dilation=dils[0]), nn.ReLU()]
+        self.c_in = c_in
+        mods = [nn.Conv2d(c_in, ch, 3, padding=dils[0], dilation=dils[0]), nn.ReLU()]
         for d in dils[1:]:
             mods += [nn.Conv2d(ch, ch, 3, padding=d, dilation=d), nn.ReLU()]
         mods += [nn.Conv2d(ch, K, 1)]
@@ -55,9 +56,9 @@ def load_ctx(path):
     """체크포인트 → (CtxNet, state_dict, dils). 예전 형식(state_dict 만)도 읽는다."""
     ck = torch.load(path)
     sd, dils = (ck["sd"], ck["dils"]) if "sd" in ck else (ck, None)
-    ch = sd["net.0.weight"].shape[0]
+    ch, c_in = sd["net.0.weight"].shape[:2]
     layers = sum(1 for k in sd if k.endswith(".weight")) - 1
-    m = CtxNet(ch, layers, dils)
+    m = CtxNet(ch, layers, dils, c_in)
     m.load_state_dict(sd)
     return m, sd, dils
 
@@ -91,6 +92,15 @@ def fq_weights(model, bits: int) -> dict:
     return out
 
 
+def pad_input(sd: dict, c_in: int) -> dict:
+    """첫 층 입력 채널을 c_in 으로 (새 채널 가중치 0 → 처음엔 같은 출력)."""
+    sd = dict(sd)
+    w = sd["net.0.weight"]
+    if w.shape[1] < c_in:
+        sd["net.0.weight"] = torch.cat([w, w.new_zeros(w.shape[0], c_in - w.shape[1], *w.shape[2:])], 1)
+    return sd
+
+
 def frame_maps(seg, t):
     return seg[t : t + 1], (seg[t - 1 : t] if t >= 1 else None), (seg[t - 2 : t - 1] if t >= 2 else None)
 
@@ -102,8 +112,8 @@ def eval_bits(model, seg, frames):
     for t in frames:
         cur, prev, prev2 = frame_maps(seg, t)
         for s in LEVELS:
-            for kind in "AB":
-                x, target, g = build_input(cur, prev, prev2, s, kind)
+            for kind in sc.PASSES[model.c_in]:
+                x, target, g = build_input(cur, prev, prev2, s, kind, model.c_in)
                 logp = F.log_softmax(model(x), 1)
                 nll = -logp.gather(1, g[:, None])[:, 0][:, target].sum().item() / math.log(2)
                 tot[f"{kind}{s}"] = tot.get(f"{kind}{s}", 0.0) + nll
@@ -124,6 +134,7 @@ def main():
     ap.add_argument("--init", default=None)
     ap.add_argument("--widen-from", default=None, help="이 체크포인트 (self-compression 이면 float 가중치) 를 --ch 폭으로 넓혀서 시작 (처음엔 같은 출력)")
     ap.add_argument("--dils", default=None, help="층별 dilation, 예: 1,2,4,2,1")
+    ap.add_argument("--split-b", action="store_true", help="B 패스를 B1·B2 로 나눈 23채널 모델 (--init 이 22채널이면 새 입력 채널 0 으로 이어서)")
     ap.add_argument("--self-compress", type=float, default=0.0,
                     help="> 0 이면 채널별 비트 수를 학습 (selfcomp.py, 시작 --sc-init-bits). 1.0 = 가중치 1비트 ≈ 스트림 1비트")
     ap.add_argument("--sc-init-bits", type=float, default=6.0)
@@ -140,7 +151,9 @@ def main():
     rng = np.random.default_rng(0)
     _, seg, _ = load_gt()
     dils = [int(d) for d in args.dils.split(",")] if args.dils else None
-    model = CtxNet(args.ch, args.layers, dils)
+    c_in = 23 if args.split_b else C_IN
+    passes = sc.PASSES[c_in]
+    model = CtxNet(args.ch, args.layers, dils, c_in)
     if args.widen_from:
         ckw = torch.load(args.widen_from)
         sdw = ckw.get("float", ckw.get("sd", ckw))
@@ -150,7 +163,7 @@ def main():
         print(f"폭 {old.net[0].weight.shape[0]} → {args.ch} 로 넓혀서 시작", flush=True)
     if args.init:
         ck = torch.load(args.init)
-        model.load_state_dict(ck["sd"] if "sd" in ck else ck)
+        model.load_state_dict(pad_input(ck["sd"] if "sd" in ck else ck, c_in))
     print(f"ctxnet params {sum(p.numel() for p in model.parameters()):,}", flush=True)
     sc = None
     groups = [{"params": list(model.parameters()), "lr": args.lr}]
@@ -159,7 +172,7 @@ def main():
 
         sc = SelfCompress(model, args.sc_init_bits)
         if args.init and "sc" in ck and "float" in ck:  # self-compression 이어서: float 가중치 + 비트/스케일
-            model.load_state_dict(ck["float"])
+            model.load_state_dict(pad_input(ck["float"], c_in))
             sc.load_state_dict(ck["sc"])
         # 손실 = 대상 칸당 nats. 스트림 전체 비트 ≈ 손실/ln2 × 부호화 칸 수 (601장 × 384·512) → 가중치 1비트와 같은 값으로
         gamma = args.self_compress * 0.75 * sc.total / (601 * SH * SW / math.log(2))
@@ -183,8 +196,8 @@ def main():
         xs, tg, gs = [], [], []
         for t in ts:
             cur, prev, prev2 = frame_maps(seg, int(t))
-            kind = "A" if rng.random() < 0.5 else "B"
-            x, target, g = build_input(cur, prev, prev2, s, kind)
+            kind = passes[int(rng.integers(len(passes)))]
+            x, target, g = build_input(cur, prev, prev2, s, kind, c_in)
             c = min(args.crop, gh, gw)
             # 크롭 시작은 짝수 칸 (A/B 패턴 유지)
             i0 = int(rng.integers(0, (gh - c) // 2 + 1)) * 2

@@ -33,7 +33,7 @@ def reconstruct(p: bytes, batch: int = 8):
     """archive 바이트 → (even, odd) float32 (600,384,512,3) 두 배열 (평가 네트워크가 볼 값)."""
     sec = archive.unpack(p)
     qnet, _ = segcodec.QNet.from_bytes(wcodec.ec_unpack_qnet(sec["ctxe"]) if "ctxe" in sec else archive.unxz(sec["ctxn"]))
-    probe = np.random.default_rng(0).integers(0, segcodec.Q_IN + 1, (1, segcodec.C_IN, 48, 64))
+    probe = np.random.default_rng(0).integers(0, segcodec.Q_IN + 1, (1, qnet.c_in, 48, 64))
     if not qnet.self_check(probe):
         log("float32 합성곱이 정확하지 않아 float64 로 디코드합니다 (느림)")
     t = time.time()

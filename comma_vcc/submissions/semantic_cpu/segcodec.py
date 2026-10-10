@@ -1,6 +1,7 @@
 """seg 맵 무손실 코덱 (제출물에 그대로 들어가는 자체 완결 모듈: numpy, torch, constriction 만 사용).
 
 순서: 프레임마다 stride-32 격자(coarse) → 레벨 s=32..2 에서 A 패스, B 패스.
+      입력 23채널 모델은 B 를 B1 (홀수 행) → B2 (홀수 열) 로 나눈다 (B2 는 대각 이웃까지 안다).
 확률: coarse 는 적응형 정수 카운트, 나머지는 정수 CNN (float64 로 계산하지만 값이 전부 정수라 결과가 기계와 무관).
 
 정수 CNN 규약
@@ -23,6 +24,7 @@ SH, SW = 384, 512
 LEVELS = [32, 16, 8, 4, 2]
 K = 5
 C_IN = 22
+PASSES = {22: ("A", "B"), 23: ("A", "B1", "B2")}  # 입력 채널 수 → 레벨마다 패스 순서 (23: B 를 둘로 나눠 B2 가 8방향 이웃을 다 안다)
 Q_IN = 64  # 입력 스케일
 LOGIT_UNIT = 16  # logit 1 nat = 16
 SHIFT = 16
@@ -50,13 +52,17 @@ def masks(h: int, kind: str):
     gj = (np.arange(SW // h) % 2)[None, :]
     if kind == "A":
         known, target = (gi == 0) & (gj == 0), (gi == 1) & (gj == 1)
-    else:
+    elif kind == "B":
         known, target = gi == gj, gi != gj
+    elif kind == "B1":
+        known, target = gi == gj, (gi == 1) & (gj == 0)
+    else:  # B2
+        known, target = (gi == gj) | ((gi == 1) & (gj == 0)), (gi == 0) & (gj == 1)
     return known, target
 
 
-def build_input_q(cur: np.ndarray, prev, prev2, s: int, kind: str) -> np.ndarray:
-    """cur: (n,384,512) uint8 (target 칸은 아무 값이어도 됨). → (n,22,gh,gw) int64 (0..64)"""
+def build_input_q(cur: np.ndarray, prev, prev2, s: int, kind: str, c_in: int = C_IN) -> np.ndarray:
+    """cur: (n,384,512) uint8 (target 칸은 아무 값이어도 됨). → (n,c_in,gh,gw) int64 (0..64)"""
     h = s // 2
     n = cur.shape[0]
     g = cur[:, ::h, ::h]
@@ -64,14 +70,17 @@ def build_input_q(cur: np.ndarray, prev, prev2, s: int, kind: str) -> np.ndarray
     gh, gw = known.shape
     lvl = np.zeros((n, len(LEVELS), gh, gw), np.int64)
     lvl[:, LEVELS.index(s)] = Q_IN
-    return np.concatenate([
+    parts = [
         onehot_np(g) * known * Q_IN,
         np.broadcast_to(known * Q_IN, (n, 1, gh, gw)),
         frac_q(prev, h, n),
         frac_q(prev2, h, n),
         np.full((n, 1, gh, gw), Q_IN if kind == "A" else 0, np.int64),
         lvl,
-    ], 1)
+    ]
+    if c_in > C_IN:
+        parts.append(np.full((n, 1, gh, gw), Q_IN if kind == "B2" else 0, np.int64))
+    return np.concatenate(parts, 1)
 
 
 class FastInput:
@@ -79,11 +88,12 @@ class FastInput:
 
     HS = [s // 2 for s in LEVELS]
 
-    def __init__(self):
+    def __init__(self, c_in: int = C_IN):
+        self.c_in = c_in
         self.known = {}
         for s in LEVELS:
             h = s // 2
-            for kind in "AB":
+            for kind in PASSES[c_in]:
                 kn, tg = masks(h, kind)
                 self.known[h, kind] = (torch.from_numpy(kn).float(), torch.from_numpy(tg))
 
@@ -103,8 +113,11 @@ class FastInput:
         oh = F.one_hot(g.long(), K).permute(0, 3, 1, 2).float() * (kn * Q_IN)
         lvl = torch.zeros(n, len(LEVELS), gh, gw)
         lvl[:, LEVELS.index(s)] = Q_IN
-        return torch.cat([oh, (kn * Q_IN).expand(n, 1, gh, gw), fp[h], fp2[h],
-                          torch.full((n, 1, gh, gw), float(Q_IN if kind == "A" else 0)), lvl], 1)
+        parts = [oh, (kn * Q_IN).expand(n, 1, gh, gw), fp[h], fp2[h],
+                 torch.full((n, 1, gh, gw), float(Q_IN if kind == "A" else 0)), lvl]
+        if self.c_in > C_IN:
+            parts.append(torch.full((n, 1, gh, gw), float(Q_IN if kind == "B2" else 0)))
+        return torch.cat(parts, 1)
 
 
 # ---------------------------------------------------------------- 정수 네트워크
@@ -113,6 +126,8 @@ class QNet:
 
     def __init__(self, layers):
         self.layers = layers
+        self.c_in = layers[0][0].shape[1]
+        self.passes = PASSES[self.c_in]
         # float32 합성곱이 정확하려면 모든 부분합의 절댓값이 2^24 미만이어야 한다
         in_max = Q_IN
         for W, _, _, _, relu in layers:
@@ -277,7 +292,7 @@ def encode(seg: np.ndarray, qnet: QNet, chunk: int = 16) -> bytes:
     fam = _family()
     cm = CoarseModel()
     cy, cx = coarse_pos()
-    fi = FastInput()
+    fi = FastInput(qnet.c_in)
     seg_t = torch.from_numpy(seg)
     for t0 in range(0, n, chunk):
         t1 = min(t0 + chunk, n)
@@ -299,7 +314,7 @@ def encode(seg: np.ndarray, qnet: QNet, chunk: int = 16) -> bytes:
         with torch.inference_mode():
             for s in LEVELS:
                 h = s // 2
-                for kind in "AB":
+                for kind in qnet.passes:
                     _, tg = fi.known[h, kind]
                     logit = qnet.run(fi.build(cur, s, kind, fp, fp2))  # (b,5,gh,gw)
                     lt = logit[:, :, tg].permute(0, 2, 1).to(torch.int64).numpy()  # (b,nt,5)
@@ -326,7 +341,7 @@ def decode(buf: bytes, qnet: QNet, progress=None) -> np.ndarray:
     fam = _family()
     cm = CoarseModel()
     cy, cx = coarse_pos()
-    fi = FastInput()
+    fi = FastInput(qnet.c_in)
     seg = np.zeros((n, SH, SW), np.uint8)
     seg_t = torch.from_numpy(seg)  # 메모리 공유
     fp, fp2 = fi.fracs(None, 1), fi.fracs(None, 1)
@@ -339,7 +354,7 @@ def decode(buf: bytes, qnet: QNet, progress=None) -> np.ndarray:
             cm.update(ctx, sym.astype(np.int64))
             for s in LEVELS:
                 h = s // 2
-                for kind in "AB":
+                for kind in qnet.passes:
                     _, tg = fi.known[h, kind]
                     logit = qnet.run(fi.build(cur, s, kind, fp, fp2))[0]  # (5,gh,gw)
                     p = probs_from_logits_t(logit[:, tg].T)
