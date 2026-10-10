@@ -25,6 +25,7 @@ import segcodec as sc  # noqa: E402
 LEVELS = sc.LEVELS
 K = sc.K
 C_IN = sc.C_IN
+PASSES = sc.PASSES
 
 
 def build_input(cur, prev, prev2, s: int, kind: str, c_in: int = C_IN):
@@ -154,7 +155,7 @@ def main():
     dils = [int(d) for d in args.dils.split(",")] if args.dils else None
     c_in = 24 if args.split_a else 23 if args.split_b else C_IN
     align = 4 if c_in >= 24 else 2  # 크롭 시작: 패스 패턴의 주기
-    passes = sc.PASSES[c_in]
+    passes = PASSES[c_in]
     model = CtxNet(args.ch, args.layers, dils, c_in)
     if args.widen_from:
         ckw = torch.load(args.widen_from)
