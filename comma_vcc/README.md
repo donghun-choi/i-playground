@@ -35,16 +35,16 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.11, 점수 0.1389)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.12, 점수 0.1355)
 
 ```
-archive (171KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (120KB) + 렌더러 (20KB, 폭 24·32·40, 채널별 학습 비트, 218/251 채널) + pose (17KB, 기저 8개 5비트, 계수 8비트 Rice 부호)
+archive (171KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (120KB) + 렌더러 (20KB, 폭 24·32·40, 채널별 학습 비트, 218/251 채널) + pose (11KB, 회색 기저 8개 5비트, 계수 8비트 Rice 부호)
                (문맥 모델·렌더러 정수 가중치는 채널별 이산 라플라스 range coder, wcodec.py)
 
 seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본 짝수 프레임 0 의 맵 1장)
 홀수 프레임 i   = 렌더러(M_i)                                         → SegNet 이 M_i 를 내도록 학습
 짝수 프레임 i   = 아핀_i(홀수 프레임 i-1) + bicubic(Σ_k c[i,k] · B_k)    → PoseNet 이 원본 pose 를 내도록 피팅
-                  (아핀 6개 + 계수 8개는 쌍마다, 기저 B 8x3x24x32 는 공유)
+                  (아핀 6개 + 계수 8개는 쌍마다, 기저 B 8x1x24x32 (회색 = 밝기만) 는 공유)
 1164x874 기록    = 512x384 float 이미지를 2x2 서브픽셀 정수로 펼침 (평가의 bilinear 축소가 그대로 되돌림)
 ```
 
@@ -136,6 +136,9 @@ cd comma_vcc/lab
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl3.pt --cbits 5 --renderer ../cache/renderer_c8_sc4.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc4_k8.bin --segs ../cache/segs_pre_scl3.bin --wec
 # v6.11: 문맥 모델 라운드 4 (scl3 → scl4, 20000스텝 lr 2e-4) — 여기서 수렴 (-160 B)
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl4.pt --cbits 5 --renderer ../cache/renderer_c8_sc4.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc4_k8.bin --segs ../cache/segs_pre_scl4.bin --wec
+# v6.12: pose 기저를 회색 1채널로 (RGB 의 Y 가중 평균에서 시작해 다시 학습)
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_sc4_k8.bin --renderer ../cache/renderer_c8_sc4.pt --renderer-cfg 24,32,40 --rbits 0 --cbits 8 --b-gray --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_sc4_gray.bin
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl4.pt --cbits 5 --renderer ../cache/renderer_c8_sc4.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc4_gray.bin --segs ../cache/segs_pre_scl4.bin --wec
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -248,6 +251,9 @@ CPU 로는 렌더러 flip 학습 1에폭이 약 8분이라, 같은 레시피를 
   초기 스케일 하한 1e-3, 저장 스케일 하한 2^-14 로 고침.
 - 렌더러 24·32·40 → 32·40·48 (함수 보존 확장 + self-compression laplace 10에폭): 600장 불일치 0.000226, 렌더러 23.6KB →
   seg + 렌더러 rate 0.0383 (24·32·40 사이클 4 는 0.0356). 넓힌 채널이 하나도 잘리지 않았다 (315/315). 손해.
+- (v6.12) pose 기저를 회색 1채널로 (RGB 에 같은 값 = 밝기만 바꿈, PoseNet 입력이 YUV 라서): 기저 에너지의 79% 가 이미 회색 성분.
+  다시 맞추면 본 학습 중 회전 차원은 2배 나쁘지만 plain·탐욕 탐색 뒤엔 d 1.04e-6 → 1.47e-6 (항 0.0032 → 0.0038) 뿐이고
+  pose 섹션 16.7KB → 10.7KB → 점수 -0.0034.
 - pose 기저를 QAT 로 학습할 때 에폭별 평가가 float 기저를 써서 0번 차원이 엉뚱하게 크게 보였다 (실제 학습은 정상). 저장 격자 기저로 재도록 고침.
 - 효과 없던 것: 패스별 확률 온도 보정 (-0.04%, 문맥 모델이 이미 잘 보정됨), 순수 엔트로피 부호 (xz 가 이미 0차 엔트로피 근처, 전체 -1.4KB).
 - pose 계수는 시간 상관이 없다 (차분 분산이 값 분산의 2배) → 차분 + xz 대신 (값 - 평균) 을 Rice 부호로: 14.7KB → 12.4KB (`pos3` 섹션).
@@ -303,3 +309,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v6.9 | 0.000220 | 0.0000010 | 0.00458 | **0.1397** | 문맥 모델 20000스텝 더 (lr 3e-4): 모델+스트림 135,792 → 134,539 B. inflate 396s |
 | semantic_cpu v6.10 | 0.000220 | 0.0000010 | 0.00455 | **0.1390** | 문맥 모델 한 라운드 더: 모델+스트림 134,539 → 133,478 B (스트림 200 B/frame). inflate 406s |
 | semantic_cpu v6.11 | 0.000220 | 0.0000010 | 0.00455 | **0.1389** | 문맥 모델 라운드 4: 133,478 → 133,318 B (수렴). inflate 399s |
+| semantic_cpu v6.12 | 0.000220 | 0.0000015 | 0.00439 | **0.1355** | pose 기저 회색 1채널 (pose 섹션 16.7KB → 10.7KB, pose 항 0.0032 → 0.0038). inflate 355s |
