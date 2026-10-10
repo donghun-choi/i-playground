@@ -131,15 +131,24 @@ class FastInput:
 class QNet:
     """layers: [(W_q int (o,i,kh,kw), B_q int (o,), M int (o,), dil, relu)]  (padding = dil * (k//2))"""
 
-    def __init__(self, layers):
+    def __init__(self, layers, f32: bool = False):
+        """f32: 재양자화를 float32 로 (빠른 경로, channels_last 합성곱). float64 와 값이 조금 다르지만
+        IEEE 덧셈·곱셈은 정확히 반올림되므로 기계와 무관하게 같다. 직렬화 때 첫 층 relu 바이트의 비트 1 로 기록."""
         self.layers = layers
+        self.f32 = f32
         self.c_in = layers[0][0].shape[1]
         self.passes = PASSES[self.c_in]
         # float32 합성곱이 정확하려면 모든 부분합의 절댓값이 2^24 미만이어야 한다
         in_max = Q_IN
-        for W, _, _, _, relu in layers:
+        for W, B, M, _, relu in layers:
             assert in_max * np.abs(W).sum((1, 2, 3)).max() < 2**24, "float32 정확 범위 초과"
+            if f32:  # acc + B 와 M·2^-16 이 float32 에서 정확
+                assert in_max * np.abs(W).sum((1, 2, 3)).max() + np.abs(B).max() < 2**24 and np.abs(M).max() < 2**24
             in_max = 255
+        self._g = [(torch.from_numpy(W.astype(np.float32)).contiguous(memory_format=torch.channels_last),
+                    torch.from_numpy(B.astype(np.float32)).view(1, -1, 1, 1),
+                    torch.from_numpy((M * 2.0**-SHIFT).astype(np.float32)).view(1, -1, 1, 1), dil, relu)
+                   for W, B, M, dil, relu in layers]
         self._t = [(torch.from_numpy(W.astype(np.float32)), torch.from_numpy(B).view(1, -1, 1, 1),
                     torch.from_numpy(M).view(1, -1, 1, 1), dil, relu) for W, B, M, dil, relu in layers]
         # 재양자화를 float64 로: (acc + B) * M 은 2^53 보다 훨씬 작은 정수라 정확, 2^-16 곱도 정확 → floor 는 >> 와 같다
@@ -147,11 +156,20 @@ class QNet:
         self.dtype = torch.float32
 
     def self_check(self, x_q: np.ndarray) -> bool:
-        """이 기계의 float32 합성곱이 정확한지 float64 결과와 비교. 아니면 float64 로 전환."""
-        self.dtype = torch.float64
-        ref = self(x_q)
-        self.dtype = torch.float32
-        ok = np.array_equal(ref, self(x_q))
+        """이 기계의 float32 합성곱이 정확한지 float64 결과와 비교. 아니면 float64 로 전환.
+        f32 경로는 레벨마다 격자 크기가 달라 (합성곱 구현이 달라질 수 있어) 모든 크기에서 확인한다."""
+        if self.f32:
+            rng = np.random.default_rng(0)
+            xs = [torch.from_numpy(rng.integers(0, Q_IN + 1, (1, self.c_in, SH // (s // 2), SW // (s // 2)))).float() for s in LEVELS]
+            self.dtype = torch.float64
+            ref = [self.run(x) for x in xs]
+            self.dtype = torch.float32
+            ok = all(torch.equal(r, self.run(x)) for r, x in zip(ref, xs))
+        else:
+            self.dtype = torch.float64
+            ref = self(x_q)
+            self.dtype = torch.float32
+            ok = np.array_equal(ref, self(x_q))
         if not ok:
             self.dtype = torch.float64
         return ok
@@ -168,7 +186,16 @@ class QNet:
         return x.to(torch.int64).numpy()
 
     def run(self, x: torch.Tensor) -> torch.Tensor:
-        """x: float32 정수값 텐서 → 정수값 logits (float32 텐서). __call__ 과 결과가 같다."""
+        """x: float32 정수값 텐서 → 정수값 logits (float32 텐서). f32 가 아니면 __call__ 과 결과가 같다."""
+        if self.f32:
+            x = x.to(self.dtype).contiguous(memory_format=torch.channels_last)
+            for W, B, Ms, dil, relu in self._g:
+                y = F.conv2d(x, W.to(self.dtype), padding=dil * (W.shape[-1] // 2), dilation=dil).float()  # 정확한 정수
+                y.add_(B).mul_(Ms).floor_()
+                if relu:
+                    y.clamp_(0, 255)
+                x = y.to(self.dtype)
+            return x.float().contiguous()
         x = x.to(self.dtype)
         for W, B, Ms, dil, relu in self._f:
             y = F.conv2d(x, W.to(self.dtype), padding=dil * (W.shape[-1] // 2), dilation=dil).double().add_(B).mul_(Ms).floor_()
@@ -180,9 +207,9 @@ class QNet:
     # 직렬화: 층 수, 각 층 (o,i,k,pad,relu) + W(int8) + B(int32) + M(int32)
     def to_bytes(self) -> bytes:
         out = [struct.pack("<B", len(self.layers))]
-        for W, B, M, dil, relu in self.layers:
+        for li, (W, B, M, dil, relu) in enumerate(self.layers):
             o, i, k, _ = W.shape
-            out.append(struct.pack("<HHBBB", o, i, k, dil, int(relu)))
+            out.append(struct.pack("<HHBBB", o, i, k, dil, int(relu) | (2 if self.f32 and li == 0 else 0)))
             out.append(W.astype(np.int8).tobytes())
             out.append(B.astype(np.int32).tobytes())
             out.append(M.astype(np.int32).tobytes())
@@ -192,9 +219,11 @@ class QNet:
     def from_bytes(cls, buf: bytes, off: int = 0):
         (n,) = struct.unpack_from("<B", buf, off)
         off += 1
-        layers = []
-        for _ in range(n):
+        layers, f32 = [], False
+        for li in range(n):
             o, i, k, dil, relu = struct.unpack_from("<HHBBB", buf, off)
+            if li == 0:
+                f32, relu = bool(relu & 2), relu & 1
             dil = max(dil, 1)  # 예전 형식은 1x1 층에 0 (padding) 을 적었다
             off += 7
             W = np.frombuffer(buf, np.int8, o * i * k * k, off).reshape(o, i, k, k).astype(np.int64)
@@ -204,10 +233,11 @@ class QNet:
             M = np.frombuffer(buf, np.int32, o, off).astype(np.int64)
             off += 4 * o
             layers.append((W, B, M, dil, bool(relu)))
-        return cls(layers), off
+        return cls(layers, f32), off
 
 
-def quantize_ctxnet(state_dict: dict, calib_inputs: list[np.ndarray], wbits: int = 8, dils=None, wq: dict | None = None) -> QNet:
+def quantize_ctxnet(state_dict: dict, calib_inputs: list[np.ndarray], wbits: int = 8, dils=None, wq: dict | None = None,
+                    f32: bool = False) -> QNet:
     """float CtxNet (Conv-ReLU 반복 + 마지막 1x1) → QNet. calib_inputs: build_input_q 결과 몇 개.
 
     wq: 층 이름 → (정수 가중치, 출력 채널별 스케일). 주면 그 양자화를 그대로 쓴다 (self-compression 학습 결과).
@@ -243,7 +273,7 @@ def quantize_ctxnet(state_dict: dict, calib_inputs: list[np.ndarray], wbits: int
         layers.append((W_q.numpy().astype(np.int64), B_q.numpy().astype(np.int64), M.numpy().astype(np.int64), dil, not last))
         x_float = [y for y in ys] if not last else x_float
         s_in = s_out
-    return QNet(layers)
+    return QNet(layers, f32)
 
 
 def probs_from_logits(logit_q: np.ndarray) -> np.ndarray:

@@ -25,7 +25,7 @@ from model import make_renderer, pack_state  # noqa: E402
 import wcodec  # noqa: E402
 
 
-def build_qnet(ckpt: str, seg, wbits: int = 8) -> sc.QNet:
+def build_qnet(ckpt: str, seg, wbits: int = 8, f32: bool = False) -> sc.QNet:
     from ctxmodel import load_ctx
 
     _, sd, dils = load_ctx(ckpt)
@@ -33,7 +33,7 @@ def build_qnet(ckpt: str, seg, wbits: int = 8) -> sc.QNet:
     calib = [sc.build_input_q(seg[t : t + 1], seg[t - 1 : t], seg[t - 2 : t - 1], s, k, c_in)
              for t in (50, 200, 350, 500) for s in sc.LEVELS for k in sc.PASSES[c_in]]
     wq = torch.load(ckpt).get("wq")  # self-compression 학습 결과 (채널별 비트) 면 그 양자화를 그대로
-    return sc.quantize_ctxnet(sd, calib, wbits=wbits, dils=dils, wq=wq)
+    return sc.quantize_ctxnet(sd, calib, wbits=wbits, dils=dils, wq=wq, f32=f32)
 
 
 def main():
@@ -50,13 +50,14 @@ def main():
     ap.add_argument("--cbits", type=int, default=8, help="문맥 모델 가중치 비트 수")
     ap.add_argument("--segs-only", action="store_true", help="seg 스트림만 인코드해서 캐시에 저장")
     ap.add_argument("--no-verify", action="store_true", help="seg 디코드 왕복 확인 생략")
+    ap.add_argument("--ctx-f32", action="store_true", help="문맥 모델 재양자화를 float32 + channels_last 로 (디코드 약 2배 빠름, 스트림은 이 설정으로 다시 인코드해야 함)")
     ap.add_argument("--wec", action="store_true", help="문맥 모델·렌더러 정수 가중치와 pose 기저를 채널별 라플라스 range coder 로 (wcodec, xz 대비 약 -2.3KB)")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     _, seg, _ = load_gt()
 
     t = time.time()
-    q = build_qnet(args.ctx, seg, args.cbits)
+    q = build_qnet(args.ctx, seg, args.cbits, args.ctx_f32)
     ctx_name = "ctxe" if args.wec else "ctxn"
     ctxn = wcodec.ec_pack_qnet(q.to_bytes()) if args.wec else archive.xz(q.to_bytes())
     if args.pose2:
