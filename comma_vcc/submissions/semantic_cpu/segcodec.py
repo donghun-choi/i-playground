@@ -1,7 +1,7 @@
 """seg 맵 무손실 코덱 (제출물에 그대로 들어가는 자체 완결 모듈: numpy, torch, constriction 만 사용).
 
 순서: 프레임마다 stride-32 격자(coarse) → 레벨 s=32..2 에서 A 패스, B 패스.
-      입력 23채널 모델은 B 를 B1 (홀수 행) → B2 (홀수 열) 로 나눈다 (B2 는 대각 이웃까지 안다). 24채널은 A 도 체커보드로 A1 → A2.
+      입력 23채널 모델은 A 를 체커보드로 A1 → A2 로 나눈다. 24채널은 B 도 B1 → B2 로 (PASSES).
 확률: coarse 는 적응형 정수 카운트, 나머지는 정수 CNN (float64 로 계산하지만 값이 전부 정수라 결과가 기계와 무관).
 
 정수 CNN 규약
@@ -24,8 +24,10 @@ SH, SW = 384, 512
 LEVELS = [32, 16, 8, 4, 2]
 K = 5
 C_IN = 22
-# 입력 채널 수 → 레벨마다 패스 순서. 23: B 를 둘로 나눠 B2 가 8방향 이웃을 다 안다. 24: A 도 체커보드로 둘로.
-PASSES = {22: ("A", "B"), 23: ("A", "B1", "B2"), 24: ("A1", "A2", "B1", "B2")}
+# 입력 채널 수 → 레벨마다 패스 순서와 추가 입력 채널 (그 패스일 때 64). 23: A 를 체커보드로 A1 → A2 (A2 는 A1 을 안다).
+# 24: B 도 B1 (홀수 행) → B2 (홀수 열) 로 (B2 는 대각 이웃까지 안다 — 비트는 거의 그대로였다).
+PASSES = {22: ("A", "B"), 23: ("A1", "A2", "B"), 24: ("A1", "A2", "B1", "B2")}
+EXTRA = {22: (), 23: ("A2",), 24: ("B2", "A2")}
 Q_IN = 64  # 입력 스케일
 LOGIT_UNIT = 16  # logit 1 nat = 16
 SHIFT = 16
@@ -84,7 +86,7 @@ def build_input_q(cur: np.ndarray, prev, prev2, s: int, kind: str, c_in: int = C
         np.full((n, 1, gh, gw), Q_IN if kind[0] == "A" else 0, np.int64),
         lvl,
     ]
-    for extra in ("B2", "A2")[: c_in - C_IN]:
+    for extra in EXTRA[c_in]:
         parts.append(np.full((n, 1, gh, gw), Q_IN if kind == extra else 0, np.int64))
     return np.concatenate(parts, 1)
 
@@ -121,7 +123,7 @@ class FastInput:
         lvl[:, LEVELS.index(s)] = Q_IN
         parts = [oh, (kn * Q_IN).expand(n, 1, gh, gw), fp[h], fp2[h],
                  torch.full((n, 1, gh, gw), float(Q_IN if kind[0] == "A" else 0)), lvl]
-        for extra in ("B2", "A2")[: self.c_in - C_IN]:
+        for extra in EXTRA[self.c_in]:
             parts.append(torch.full((n, 1, gh, gw), float(Q_IN if kind == extra else 0)))
         return torch.cat(parts, 1)
 
