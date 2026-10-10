@@ -35,10 +35,10 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.12, 점수 0.1355)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.13, 점수 0.1336)
 
 ```
-archive (171KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (120KB) + 렌더러 (20KB, 폭 24·32·40, 채널별 학습 비트, 218/251 채널) + pose (11KB, 회색 기저 8개 5비트, 계수 8비트 Rice 부호)
+archive (161KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (120KB) + 렌더러 (17KB, 폭 24·32·40, 채널별 학습 비트, 215/251 채널) + pose (11KB, 회색 기저 8개 5비트, 계수 8비트 Rice 부호)
                (문맥 모델·렌더러 정수 가중치는 채널별 이산 라플라스 range coder, wcodec.py)
 
 seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본 짝수 프레임 0 의 맵 1장)
@@ -139,6 +139,11 @@ cd comma_vcc/lab
 # v6.12: pose 기저를 회색 1채널로 (RGB 의 Y 가중 평균에서 시작해 다시 학습)
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_sc4_k8.bin --renderer ../cache/renderer_c8_sc4.pt --renderer-cfg 24,32,40 --rbits 0 --cbits 8 --b-gray --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_sc4_gray.bin
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl4.pt --cbits 5 --renderer ../cache/renderer_c8_sc4.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc4_gray.bin --segs ../cache/segs_pre_scl4.bin --wec
+# v6.13: 렌더러 self-compression 크기 손실 ×2 로 사이클 2번 (sc4 → sc5g2 → sc6g2) + 회색 기저 pose 재피팅
+../.venv/bin/python renderer.py --widths 24,32,40 --resume ../cache/renderer_c8_sc4.pt --epochs 10 --lr 3e-4 --bs 4 --cosine --fp32 --bits 4 --self-compress 2.0 --sc-rate laplace --loss flip --full-eval --out ../cache/renderer_c8_sc5g2.pt
+../.venv/bin/python renderer.py --widths 24,32,40 --resume ../cache/renderer_c8_sc5g2.pt --epochs 10 --lr 3e-4 --bs 4 --cosine --fp32 --bits 4 --self-compress 2.0 --sc-rate laplace --loss flip --full-eval --out ../cache/renderer_c8_sc6g2.pt
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_sc4_gray.bin --renderer ../cache/renderer_c8_sc6g2.pt --renderer-cfg 24,32,40 --rbits 0 --cbits 8 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_sc6g2_gray.bin
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24scl4.pt --cbits 5 --renderer ../cache/renderer_c8_sc6g2.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc6g2_gray.bin --segs ../cache/segs_pre_scl4.bin --wec
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -312,3 +317,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v6.10 | 0.000220 | 0.0000010 | 0.00455 | **0.1390** | 문맥 모델 한 라운드 더: 모델+스트림 134,539 → 133,478 B (스트림 200 B/frame). inflate 406s |
 | semantic_cpu v6.11 | 0.000220 | 0.0000010 | 0.00455 | **0.1389** | 문맥 모델 라운드 4: 133,478 → 133,318 B (수렴). inflate 399s |
 | semantic_cpu v6.12 | 0.000220 | 0.0000015 | 0.00439 | **0.1355** | pose 기저 회색 1채널 (pose 섹션 16.7KB → 10.7KB, pose 항 0.0032 → 0.0038). inflate 355s |
+| semantic_cpu v6.13 | 0.000230 | 0.0000012 | 0.00429 | **0.1336** | 렌더러 크기 손실 ×2 사이클 2번 (20.5KB → 16.8KB, seg 0.0220 → 0.0230) + 회색 기저 pose 재피팅 (항 0.0034). inflate 387s |
