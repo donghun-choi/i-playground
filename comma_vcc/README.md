@@ -35,7 +35,7 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.15, 점수 0.1271)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.16, 점수 0.1267)
 
 ```
 archive (161KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (120KB) + 렌더러 (17KB, 폭 24·32·40, 채널별 학습 비트, 215/251 채널) + pose (11KB, 회색 기저 8개 5비트, 계수 8비트 Rice 부호)
@@ -151,6 +151,9 @@ cd comma_vcc/lab
 # v6.15: seg 코덱 A 패스 분할 (23채널 문맥 모델, scl4 에서 0 입력 채널을 붙여 20000스텝) + float32 재양자화 경로
 ../.venv/bin/python ctxmodel.py --init ../cache/ctxnet_c24scl4.pt --split-a --ch 24 --layers 5 --dils 1,2,4,2,1 --self-compress 1.0 --sc-rate laplace --sc-init-bits 5 --steps 20000 --lr 5e-4 --threads 1 --out ../cache/ctxnet_c24sa.pt
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sa.pt --cbits 5 --ctx-f32 --renderer ../cache/renderer_c8_sc7g2.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc7g2_gray.bin --wec   # → segs_pre.bin (= segs_pre_sa.bin)
+# v6.16: 문맥 모델 라운드 2
+../.venv/bin/python ctxmodel.py --init ../cache/ctxnet_c24sa.pt --split-a --ch 24 --layers 5 --dils 1,2,4,2,1 --self-compress 1.0 --sc-rate laplace --sc-init-bits 5 --steps 20000 --lr 2e-4 --threads 1 --out ../cache/ctxnet_c24sa2.pt
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sa2.pt --cbits 5 --ctx-f32 --renderer ../cache/renderer_c8_sc7g2.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc7g2_gray.bin --wec   # → segs_pre.bin (= segs_pre_sa2.bin)
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -194,6 +197,10 @@ CPU 로는 렌더러 flip 학습 1에폭이 약 8분이라, 같은 레시피를 
 - 디코드 시간은 거의 전부 문맥 CNN (range decoder 는 3s). 재양자화를 float64 → float32 로 (IEEE 덧셈·곱셈은 정확히 반올림되므로
   기계와 무관하게 같은 값, 이 모델에서는 float64 와 logit 이 완전히 같았다) + channels_last 합성곱 (3.5배 빠름): 3패스 디코드 352s → 105s.
   문맥 모델 바이트의 첫 층 relu 바이트 비트 1 로 표시해서 예전 archive 는 그대로 float64 로 디코드된다 (`--ctx-f32`).
+  AVX2 커널만 쓰게 강제해도 (`ATEN_CPU_CAPABILITY=avx2 ONEDNN_MAX_CPU_ISA=AVX2`, 평가 러너 가정) 같은 맵이 나왔다.
+- (v6.16) 3패스 문맥 모델 라운드 2 (lr 2e-4): 174 → 172 B/frame, 모델+스트림 -631 B. 라운드 3 (lr 1.5e-4) 은 그대로 172.
+  A1 을 다시 둘로 (A11 → A12, A12 는 A11 을 대각 2√2 거리에서 앎) 는 비트가 그대로. 층을 하나 끼워 수용 영역 ±10 → ±18
+  (dilation 1,2,4,8,2,1, 항등 층으로 시작) 은 170 B/frame 이지만 모델 +640 B 라 합계 -15 B (디코드 +20%) → 안 씀.
 
 ### 실험 기록 (pose carrier, 64쌍)
 | 짝수 프레임 구성 | posenet_dist |
@@ -277,6 +284,8 @@ CPU 로는 렌더러 flip 학습 1에폭이 약 8분이라, 같은 레시피를 
   600장 불일치 0.000220 → 0.000230 → seg + 렌더러 rate 0.0356 → 0.0342 (점수 공식 ×1 보다 강하게 깎는 게 이득: 크기 추정이 손실 쪽에 비해 약했다).
   ×2 사이클 3: 16.4KB, 0.000225 → 0.0334. 사이클 4 는 24장 검증은 비슷했는데 600장 0.000258 로 나빠짐 → 사이클 3 사용.
   사이클 3 에서 ×3, lr 2e-4 로 한 번 더: 렌더러 14.9KB 지만 600장 0.000253 → 0.0352 로 나빠짐 (사이클 3 에서 이어 돌린 것은 둘 다 600장에서 나빠졌다).
+  ×2, lr 1e-4 로 한 번 더: 16.9KB, 600장 0.000241 → 0.0353. 사이클 3 에서 이어 돌린 세 번이 모두 600장에서 나빠졌다.
+  렌더러 가중치 평균 (sc7g2 + 다른 사이클, float 가중치·비트·스케일 평균 후 다시 양자화, `lab/swa_renderer.py`): 0.000323 / 0.000351 로 크게 나빠짐.
 - pose 기저를 QAT 로 학습할 때 에폭별 평가가 float 기저를 써서 0번 차원이 엉뚱하게 크게 보였다 (실제 학습은 정상). 저장 격자 기저로 재도록 고침.
 - 효과 없던 것: 패스별 확률 온도 보정 (-0.04%, 문맥 모델이 이미 잘 보정됨), 순수 엔트로피 부호 (xz 가 이미 0차 엔트로피 근처, 전체 -1.4KB).
 - pose 계수는 시간 상관이 없다 (차분 분산이 값 분산의 2배) → 차분 + xz 대신 (값 - 평균) 을 Rice 부호로: 14.7KB → 12.4KB (`pos3` 섹션).
@@ -336,3 +345,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v6.13 | 0.000230 | 0.0000012 | 0.00429 | **0.1336** | 렌더러 크기 손실 ×2 사이클 2번 (20.5KB → 16.8KB, seg 0.0220 → 0.0230) + 회색 기저 pose 재피팅 (항 0.0034). inflate 387s |
 | semantic_cpu v6.14 | 0.000225 | 0.0000012 | 0.00428 | **0.1329** | 렌더러 ×2 사이클 3 (16.4KB, seg 0.0225) + 회색 기저 pose 재피팅 (항 0.0034). 160,616 B, inflate 410s + 평가 258s |
 | semantic_cpu v6.15 | 0.000225 | 0.0000012 | 0.00405 | **0.1271** | seg 코덱 A 패스 체커보드 분할 (스트림 120.2KB → 111.4KB) + 문맥 CNN float32 재양자화·channels_last (seg 디코드 251s → 126s). 152,010 B, inflate 278s + 평가 242s |
+| semantic_cpu v6.16 | 0.000225 | 0.0000012 | 0.00403 | **0.1267** | 문맥 모델 라운드 2 (모델+스트림 -631 B). 151,379 B, inflate 283s + 평가 255s |
