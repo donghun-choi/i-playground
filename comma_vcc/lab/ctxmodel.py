@@ -135,6 +135,7 @@ def main():
     ap.add_argument("--widen-from", default=None, help="이 체크포인트 (self-compression 이면 float 가중치) 를 --ch 폭으로 넓혀서 시작 (처음엔 같은 출력)")
     ap.add_argument("--dils", default=None, help="층별 dilation, 예: 1,2,4,2,1")
     ap.add_argument("--split-b", action="store_true", help="B 패스를 B1·B2 로 나눈 23채널 모델 (--init 이 22채널이면 새 입력 채널 0 으로 이어서)")
+    ap.add_argument("--split-a", action="store_true", help="A 도 A1·A2 로 나눈 24채널 모델 (--split-b 포함)")
     ap.add_argument("--self-compress", type=float, default=0.0,
                     help="> 0 이면 채널별 비트 수를 학습 (selfcomp.py, 시작 --sc-init-bits). 1.0 = 가중치 1비트 ≈ 스트림 1비트")
     ap.add_argument("--sc-init-bits", type=float, default=6.0)
@@ -151,7 +152,8 @@ def main():
     rng = np.random.default_rng(0)
     _, seg, _ = load_gt()
     dils = [int(d) for d in args.dils.split(",")] if args.dils else None
-    c_in = 23 if args.split_b else C_IN
+    c_in = 24 if args.split_a else 23 if args.split_b else C_IN
+    align = 4 if c_in >= 24 else 2  # 크롭 시작: 패스 패턴의 주기
     passes = sc.PASSES[c_in]
     model = CtxNet(args.ch, args.layers, dils, c_in)
     if args.widen_from:
@@ -199,9 +201,9 @@ def main():
             kind = passes[int(rng.integers(len(passes)))]
             x, target, g = build_input(cur, prev, prev2, s, kind, c_in)
             c = min(args.crop, gh, gw)
-            # 크롭 시작은 짝수 칸 (A/B 패턴 유지)
-            i0 = int(rng.integers(0, (gh - c) // 2 + 1)) * 2
-            j0 = int(rng.integers(0, (gw - c) // 2 + 1)) * 2
+            # 크롭 시작은 패턴 주기의 배수 (A/B 패턴 유지)
+            i0 = int(rng.integers(0, (gh - c) // align + 1)) * align
+            j0 = int(rng.integers(0, (gw - c) // align + 1)) * align
             xs.append(x[:, :, i0 : i0 + c, j0 : j0 + c])
             tg.append(target[i0 : i0 + c, j0 : j0 + c].expand(1, c, c))
             gs.append(g[:, i0 : i0 + c, j0 : j0 + c])
