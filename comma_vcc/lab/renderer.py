@@ -84,6 +84,7 @@ def main():
     ap.add_argument("--bs", type=int, default=4)
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--seed", type=int, default=0, help="학습 순서·무작위 시드 (사이클을 다른 경로로 다시 돌릴 때)")
     ap.add_argument("--out", default=str(CACHE / "renderer.pt"))
     ap.add_argument("--resume", default=None)
     ap.add_argument("--port", type=int, default=None)
@@ -108,7 +109,7 @@ def main():
     from livevis import LiveVis
 
     torch.set_num_threads(args.threads)
-    torch.manual_seed(0)
+    torch.manual_seed(args.seed)
     dev = setup_device(args.device)
     net = nets(dev)
     _, seg, _ = load_gt()
@@ -165,7 +166,7 @@ def main():
         sched.step()
         step += 1
     for ep in range(args.start_epoch, args.epochs):
-        perm = np.random.default_rng(ep).permutation(len(seg))
+        perm = np.random.default_rng(ep + 1000 * args.seed).permutation(len(seg))
         for b in range(0, len(perm) - args.bs + 1, args.bs):
             m = torch.from_numpy(seg[perm[b : b + args.bs]]).long().to(dev)
             if sc is not None:
