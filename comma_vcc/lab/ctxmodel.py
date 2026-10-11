@@ -28,10 +28,10 @@ C_IN = sc.C_IN
 PASSES = sc.PASSES
 
 
-def build_input(cur, prev, prev2, s: int, kind: str, c_in: int = C_IN):
+def build_input(cur, prev, prev2, s: int, kind: str, c_in: int = C_IN, bframe: bool = False):
     """디코더와 같은 정수 입력 (segcodec.build_input_q) 을 float (0..1) 로. cur/prev/prev2: (n,384,512) uint8 numpy."""
     h = s // 2
-    x = torch.from_numpy(sc.build_input_q(cur, prev, prev2, s, kind, c_in)).float() / sc.Q_IN
+    x = torch.from_numpy(sc.build_input_q(cur, prev, prev2, s, kind, c_in, bframe)).float() / sc.Q_IN
     _, target = sc.masks(h, kind)
     return x, torch.from_numpy(target), torch.from_numpy(cur[:, ::h, ::h].astype(np.int64))
 
@@ -128,19 +128,27 @@ def pad_input(sd: dict, c_in: int) -> dict:
     return sd
 
 
-def frame_maps(seg, t):
-    return seg[t : t + 1], (seg[t - 1 : t] if t >= 1 else None), (seg[t - 2 : t - 1] if t >= 2 else None)
+def frame_maps(seg, t, bidir: bool = False):
+    """(현재, 문맥1, 문맥2) 맵 (없으면 None). 양방향이면 segcodec.ctx_index 의 순서 (짝수 t: t-2, t-4 / 홀수 t: t-1, t+1)."""
+    a, b = sc.ctx_index(t, len(seg), bidir)
+    return seg[t : t + 1], (seg[a : a + 1] if a is not None else None), (seg[b : b + 1] if b is not None else None)
+
+
+def stream_maps(seg):
+    """스트림 순서의 맵: 첫 쌍용 맵 (seg_pre) + 홀수 프레임 600장. 양방향 모드는 B 프레임 위치가 이 번호로 정해진다."""
+    return np.concatenate([np.load(CACHE / "seg_pre.npy"), seg])
 
 
 @torch.inference_mode()
 def eval_bits(model, seg, frames):
     """전체 프레임에서 패스별 비트 수 (coarse 격자 제외)."""
     tot = {}
+    bidir = model.c_in in sc.BIDIR
     for t in frames:
-        cur, prev, prev2 = frame_maps(seg, t)
+        cur, prev, prev2 = frame_maps(seg, t, bidir)
         for s in LEVELS:
             for kind in sc.PASSES[model.c_in]:
-                x, target, g = build_input(cur, prev, prev2, s, kind, model.c_in)
+                x, target, g = build_input(cur, prev, prev2, s, kind, model.c_in, bidir and t % 2 == 1)
                 logp = F.log_softmax(model(x), 1)
                 nll = -logp.gather(1, g[:, None])[:, 0][:, target].sum().item() / math.log(2)
                 tot[f"{kind}{s}"] = tot.get(f"{kind}{s}", 0.0) + nll
@@ -163,7 +171,7 @@ def main():
     ap.add_argument("--dils", default=None, help="층별 dilation, 예: 1,2,4,2,1")
     ap.add_argument("--deepen-from", default=None, help="이 체크포인트 (self-compression 이면 float 가중치) 에 --dils 대로 항등 층을 끼워 시작")
     ap.add_argument("--split-a", action="store_true", help="A 패스를 체커보드로 A1·A2 로 나눈 23채널 모델 (--init 이 22채널이면 새 입력 채널 0 으로 이어서)")
-    ap.add_argument("--split-a1", action="store_true", help="--split-a 에 더해 A1 도 A11·A12 로 나눈 24채널 모델")
+    ap.add_argument("--bidir", action="store_true", help="--split-a 에 더해 양방향 프레임 순서 (24채널: B 프레임 표시). 학습 맵은 스트림 순서 (seg_pre + 600장)")
     ap.add_argument("--self-compress", type=float, default=0.0,
                     help="> 0 이면 채널별 비트 수를 학습 (selfcomp.py, 시작 --sc-init-bits). 1.0 = 가중치 1비트 ≈ 스트림 1비트")
     ap.add_argument("--sc-init-bits", type=float, default=6.0)
@@ -180,8 +188,10 @@ def main():
     rng = np.random.default_rng(0)
     _, seg, _ = load_gt()
     dils = [int(d) for d in args.dils.split(",")] if args.dils else None
-    assert args.split_a or not args.split_a1, "--split-a1 은 --split-a 와 함께"
-    c_in = 24 if args.split_a1 else 23 if args.split_a else C_IN
+    assert args.split_a or not args.bidir, "--bidir 은 --split-a 와 함께"
+    c_in = 24 if args.bidir else 23 if args.split_a else C_IN
+    if args.bidir:
+        seg = stream_maps(seg)
     align = 4 if c_in > C_IN else 2  # 크롭 시작: 패스 패턴의 주기
     passes = PASSES[c_in]
     model = CtxNet(args.ch, args.layers, dils, c_in)
@@ -228,6 +238,8 @@ def main():
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=args.steps, pct_start=0.05)
     viz = LiveVis(f"comma vcc · seg 문맥 모델 ch{args.ch} L{args.layers}", port=args.port).start()
     eval_frames = list(range(3, 600, 60))  # 10장
+    if args.bidir:  # 스트림 번호: 홀수 = B 프레임, 짝수 = 앵커 → 둘 다 10장씩
+        eval_frames = sorted(eval_frames + list(range(4, 600, 60)))
     # 레벨별 샘플링 비중: 세밀한 레벨에 비트가 몰려 있다
     level_p = np.array([0.04, 0.06, 0.15, 0.3, 0.45])
     t0 = time.time()
@@ -236,12 +248,12 @@ def main():
         h = s // 2
         gh, gw = SH // h, SW // h
         loss_sum, n_sum = 0.0, 0
-        ts = rng.integers(0, 600, 4)
+        ts = rng.integers(0, len(seg), 4)
         xs, tg, gs = [], [], []
         for t in ts:
-            cur, prev, prev2 = frame_maps(seg, int(t))
+            cur, prev, prev2 = frame_maps(seg, int(t), args.bidir)
             kind = passes[int(rng.integers(len(passes)))]
-            x, target, g = build_input(cur, prev, prev2, s, kind, c_in)
+            x, target, g = build_input(cur, prev, prev2, s, kind, c_in, args.bidir and int(t) % 2 == 1)
             c = min(args.crop, gh, gw)
             # 크롭 시작은 패턴 주기의 배수 (A/B 패턴 유지)
             i0 = int(rng.integers(0, (gh - c) // align + 1)) * align

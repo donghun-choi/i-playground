@@ -25,9 +25,29 @@ LEVELS = [32, 16, 8, 4, 2]
 K = 5
 C_IN = 22
 # 입력 채널 수 → 레벨마다 패스 순서와 추가 입력 채널 (그 패스일 때 64). 23: A 를 체커보드로 A1 → A2 (A2 는 A1 을 안다).
-# 24: A1 을 다시 둘로 (A11 → A12). (B 를 B1 → B2 로 나누는 것은 비트가 그대로라 뺐다.)
-PASSES = {22: ("A", "B"), 23: ("A1", "A2", "B"), 24: ("A11", "A12", "A2", "B")}
-EXTRA = {22: (), 23: ("A2",), 24: ("A2", "A12")}
+# 24: 23 + 양방향 프레임 순서 (짝수 번째 맵을 먼저 2칸 전 문맥으로, 홀수 번째 맵은 앞뒤 맵을 문맥으로; 마지막 채널 = B 프레임 표시).
+# (B 를 B1 → B2 로, A1 을 A11 → A12 로 더 나누는 것은 비트가 그대로라 뺐다.)
+PASSES = {22: ("A", "B"), 23: ("A1", "A2", "B"), 24: ("A1", "A2", "B")}
+EXTRA = {22: (), 23: ("A2",), 24: ("A2",)}
+BIDIR = {24}
+
+
+def ctx_index(t: int, n: int, bidir: bool):
+    """프레임 t 의 문맥 프레임 번호 (prev, prev2), 없으면 None. 양방향: 짝수 t 는 (t-2, t-4), 홀수 t 는 (t-1, t+1)."""
+    a, b = (t - 1, t - 2) if not bidir else (t - 2, t - 4) if t % 2 == 0 else (t - 1, t + 1)
+    return (a if 0 <= a < n else None), (b if 0 <= b < n else None)
+
+
+def coding_order(n: int, bidir: bool) -> list[int]:
+    """부호화/복호화 순서. 양방향: 0, 2, 1, 4, 3, ... (홀수 t 앞에 t+1 이 온다)."""
+    if not bidir:
+        return list(range(n))
+    order = [0]
+    for t in range(2, n, 2):
+        order += [t, t - 1]
+    if n % 2 == 0:
+        order.append(n - 1)
+    return order
 Q_IN = 64  # 입력 스케일
 LOGIT_UNIT = 16  # logit 1 nat = 16
 SHIFT = 16
@@ -68,7 +88,7 @@ def masks(h: int, kind: str):
     return known, target
 
 
-def build_input_q(cur: np.ndarray, prev, prev2, s: int, kind: str, c_in: int = C_IN) -> np.ndarray:
+def build_input_q(cur: np.ndarray, prev, prev2, s: int, kind: str, c_in: int = C_IN, bframe: bool = False) -> np.ndarray:
     """cur: (n,384,512) uint8 (target 칸은 아무 값이어도 됨). → (n,c_in,gh,gw) int64 (0..64)"""
     h = s // 2
     n = cur.shape[0]
@@ -87,6 +107,8 @@ def build_input_q(cur: np.ndarray, prev, prev2, s: int, kind: str, c_in: int = C
     ]
     for extra in EXTRA[c_in]:
         parts.append(np.full((n, 1, gh, gw), Q_IN if kind == extra else 0, np.int64))
+    if c_in in BIDIR:
+        parts.append(np.full((n, 1, gh, gw), Q_IN if bframe else 0, np.int64))
     return np.concatenate(parts, 1)
 
 
@@ -111,7 +133,8 @@ class FastInput:
         oh = F.one_hot(m_t.long(), K).permute(0, 3, 1, 2).float()
         return {h: torch.floor((F.avg_pool2d(oh, h) if h > 1 else oh) * Q_IN) for h in self.HS}
 
-    def build(self, cur_t: torch.Tensor, s: int, kind: str, fp: dict, fp2: dict) -> torch.Tensor:
+    def build(self, cur_t: torch.Tensor, s: int, kind: str, fp: dict, fp2: dict, bframe=None) -> torch.Tensor:
+        """bframe: 양방향 모드에서 프레임별 B 프레임 여부 (n,) bool 텐서 (없으면 전부 False)."""
         h = s // 2
         n = cur_t.shape[0]
         kn, _ = self.known[h, kind]
@@ -124,7 +147,20 @@ class FastInput:
                  torch.full((n, 1, gh, gw), float(Q_IN if kind[0] == "A" else 0)), lvl]
         for extra in EXTRA[self.c_in]:
             parts.append(torch.full((n, 1, gh, gw), float(Q_IN if kind == extra else 0)))
+        if self.c_in in BIDIR:
+            bf = torch.zeros(n) if bframe is None else bframe.float()
+            parts.append((bf * Q_IN).view(n, 1, 1, 1).expand(n, 1, gh, gw))
         return torch.cat(parts, 1)
+
+    def ctx_fracs(self, seg_t: torch.Tensor, idx: list) -> dict:
+        """프레임 번호 목록 (None = 없음) → 그 맵들의 비율 (없는 칸은 0)."""
+        out = self.fracs(None, len(idx))
+        valid = [i for i, k in enumerate(idx) if k is not None]
+        if valid:
+            f = self.fracs(seg_t[[idx[i] for i in valid]], len(valid))
+            for h in self.HS:
+                out[h][valid] = f[h]
+        return out
 
 
 # ---------------------------------------------------------------- 정수 네트워크
@@ -321,48 +357,40 @@ def _family():
 
 
 def encode(seg: np.ndarray, qnet: QNet, chunk: int = 16) -> bytes:
-    """프레임 chunk 개씩 묶어 확률을 한 번에 계산한 뒤, 디코드 순서(프레임 → 패스) 대로 부호화한다."""
+    """디코드 순서대로 프레임 chunk 개씩 묶어 확률을 한 번에 계산한 뒤, 그 순서(프레임 → 패스) 대로 부호화한다."""
     import constriction
 
     n = len(seg)
+    bidir = qnet.c_in in BIDIR
+    order = coding_order(n, bidir)
     enc = constriction.stream.queue.RangeEncoder()
     fam = _family()
     cm = CoarseModel()
     cy, cx = coarse_pos()
     fi = FastInput(qnet.c_in)
     seg_t = torch.from_numpy(seg)
-    for t0 in range(0, n, chunk):
-        t1 = min(t0 + chunk, n)
-        b = t1 - t0
-        cur = seg_t[t0:t1]
-
-        def shifted(k):  # 각 프레임의 k 프레임 전 맵 비율 (없으면 0)
-            lo = t0 - k
-            missing = min(b, max(0, -lo))
-            parts = []
-            if missing:
-                parts.append(fi.fracs(None, missing))
-            if b - missing:
-                parts.append(fi.fracs(seg_t[lo + missing : t1 - k], b - missing))
-            return {h: torch.cat([q[h] for q in parts]) for h in fi.HS}
-
-        fp, fp2 = shifted(1), shifted(2)
+    for i0 in range(0, n, chunk):
+        frames = order[i0 : i0 + chunk]
+        ctx = [ctx_index(t, n, bidir) for t in frames]
+        cur = seg_t[frames]
+        fp, fp2 = fi.ctx_fracs(seg_t, [c[0] for c in ctx]), fi.ctx_fracs(seg_t, [c[1] for c in ctx])
+        bf = torch.tensor([bidir and t % 2 == 1 for t in frames])
         per_pass = []
         with torch.inference_mode():
             for s in LEVELS:
                 h = s // 2
                 for kind in qnet.passes:
                     _, tg = fi.known[h, kind]
-                    logit = qnet.run(fi.build(cur, s, kind, fp, fp2))  # (b,5,gh,gw)
+                    logit = qnet.run(fi.build(cur, s, kind, fp, fp2, bf))  # (b,5,gh,gw)
                     lt = logit[:, :, tg].permute(0, 2, 1).to(torch.int64).numpy()  # (b,nt,5)
                     sy = cur[:, ::h, ::h][:, tg].numpy().astype(np.int32)  # (b,nt)
                     per_pass.append((lt, sy))
-        for j in range(b):
-            t = t0 + j
+        for j, t in enumerate(frames):
             sym = seg[t, cy, cx].astype(np.int32)
-            ctx = seg[t - 1, cy, cx].astype(np.int64) if t >= 1 else np.full(len(cy), K)
-            enc.encode(sym, fam, cm.probs(ctx))
-            cm.update(ctx, sym)
+            c0 = ctx[j][0]
+            cctx = seg[c0, cy, cx].astype(np.int64) if c0 is not None else np.full(len(cy), K)
+            enc.encode(sym, fam, cm.probs(cctx))
+            cm.update(cctx, sym)
             for lt, sy in per_pass:
                 enc.encode(np.ascontiguousarray(sy[j]), fam, probs_from_logits(lt[j]))
     words = enc.get_compressed()
@@ -379,25 +407,32 @@ def decode(buf: bytes, qnet: QNet, progress=None) -> np.ndarray:
     cm = CoarseModel()
     cy, cx = coarse_pos()
     fi = FastInput(qnet.c_in)
+    bidir = qnet.c_in in BIDIR
     seg = np.zeros((n, SH, SW), np.uint8)
     seg_t = torch.from_numpy(seg)  # 메모리 공유
-    fp, fp2 = fi.fracs(None, 1), fi.fracs(None, 1)
+    zero = fi.fracs(None, 1)
+    cache = {}  # 디코드한 프레임의 비율 (문맥으로 다시 쓰인다)
     with torch.inference_mode():
-        for t in range(n):
+        for done, t in enumerate(coding_order(n, bidir)):
             cur = seg_t[t : t + 1]
-            ctx = seg[t - 1, cy, cx].astype(np.int64) if t >= 1 else np.full(len(cy), K)
-            sym = dec.decode(fam, cm.probs(ctx))
+            c0, c1 = ctx_index(t, n, bidir)
+            fp, fp2 = cache.get(c0, zero), cache.get(c1, zero)
+            bf = torch.tensor([bidir and t % 2 == 1])
+            cctx = seg[c0, cy, cx].astype(np.int64) if c0 is not None else np.full(len(cy), K)
+            sym = dec.decode(fam, cm.probs(cctx))
             seg[t, cy, cx] = sym
-            cm.update(ctx, sym.astype(np.int64))
+            cm.update(cctx, sym.astype(np.int64))
             for s in LEVELS:
                 h = s // 2
                 for kind in qnet.passes:
                     _, tg = fi.known[h, kind]
-                    logit = qnet.run(fi.build(cur, s, kind, fp, fp2))[0]  # (5,gh,gw)
+                    logit = qnet.run(fi.build(cur, s, kind, fp, fp2, bf))[0]  # (5,gh,gw)
                     p = probs_from_logits_t(logit[:, tg].T)
                     g = cur[0, ::h, ::h]  # view
                     g[tg] = torch.from_numpy(dec.decode(fam, p).astype(np.uint8))
-            fp2, fp = fp, fi.fracs(cur, 1)
+            cache[t] = fi.fracs(cur, 1)
+            for k in [k for k in cache if k < t - 4]:
+                del cache[k]
             if progress:
-                progress(t)
+                progress(done)
     return seg
