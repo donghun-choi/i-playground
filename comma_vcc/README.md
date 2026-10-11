@@ -35,7 +35,7 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.16, 점수 0.1267)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.17, 점수 0.1256)
 
 ```
 archive (161KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (120KB) + 렌더러 (17KB, 폭 24·32·40, 채널별 학습 비트, 215/251 채널) + pose (11KB, 회색 기저 8개 5비트, 계수 8비트 Rice 부호)
@@ -154,6 +154,12 @@ cd comma_vcc/lab
 # v6.16: 문맥 모델 라운드 2
 ../.venv/bin/python ctxmodel.py --init ../cache/ctxnet_c24sa.pt --split-a --ch 24 --layers 5 --dils 1,2,4,2,1 --self-compress 1.0 --sc-rate laplace --sc-init-bits 5 --steps 20000 --lr 2e-4 --threads 1 --out ../cache/ctxnet_c24sa2.pt
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sa2.pt --cbits 5 --ctx-f32 --renderer ../cache/renderer_c8_sc7g2.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc7g2_gray.bin --wec   # → segs_pre.bin (= segs_pre_sa2.bin)
+# v6.17: 6층 문맥 모델 (항등 층 dilation 8 을 끼워서) 세 라운드 + pose 를 같은 렌더러에서 이어 150에폭
+../.venv/bin/python ctxmodel.py --deepen-from ../cache/ctxnet_c24sa.pt --split-a --ch 24 --layers 6 --dils 1,2,4,8,2,1 --self-compress 1.0 --sc-rate laplace --sc-init-bits 5 --steps 20000 --lr 5e-4 --threads 1 --out ../cache/ctxnet_c24sa6.pt
+../.venv/bin/python ctxmodel.py --init ../cache/ctxnet_c24sa6.pt --split-a --ch 24 --layers 6 --dils 1,2,4,8,2,1 --self-compress 1.0 --sc-rate laplace --sc-init-bits 5 --steps 20000 --lr 2e-4 --threads 1 --out ../cache/ctxnet_c24sa6b.pt
+../.venv/bin/python ctxmodel.py --init ../cache/ctxnet_c24sa6b.pt --split-a --ch 24 --layers 6 --dils 1,2,4,8,2,1 --self-compress 1.0 --sc-rate laplace --sc-init-bits 5 --steps 20000 --lr 1.5e-4 --threads 1 --out ../cache/ctxnet_c24sa6c.pt
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_sc7g2_gray.bin --renderer ../cache/renderer_c8_sc7g2.pt --renderer-cfg 24,32,40 --rbits 0 --cbits 8 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_sc7g2_gray2.bin
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sa6c.pt --cbits 5 --ctx-f32 --renderer ../cache/renderer_c8_sc7g2.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc7g2_gray2.bin --wec
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -201,6 +207,9 @@ CPU 로는 렌더러 flip 학습 1에폭이 약 8분이라, 같은 레시피를 
 - (v6.16) 3패스 문맥 모델 라운드 2 (lr 2e-4): 174 → 172 B/frame, 모델+스트림 -631 B. 라운드 3 (lr 1.5e-4) 은 그대로 172.
   A1 을 다시 둘로 (A11 → A12, A12 는 A11 을 대각 2√2 거리에서 앎) 는 비트가 그대로. 층을 하나 끼워 수용 영역 ±10 → ±18
   (dilation 1,2,4,8,2,1, 항등 층으로 시작) 은 170 B/frame 이지만 모델 +640 B 라 합계 -15 B (디코드 +20%) → 안 씀.
+- (v6.17) 그 6층 모델을 두 라운드 더 (lr 2e-4, 1.5e-4): 169 B/frame, 모델+스트림 124,066 → 123,570 → 123,316 B (5층보다 -765 B, 디코드 139s).
+  pose 는 같은 렌더러에서 기저를 이어 150에폭 다시: d 1.18e-6 → 8.3e-7 (항 0.0034 → 0.0029). 렌더러가 안 바뀌어도 기저를 계속 학습하면 회전 차원이 더 맞는다.
+  pose 계수 격자 8 → 7비트 (같은 실수 해에서 양자화·탐욕만 다시): pose 섹션 -1,058 B 지만 항 0.0034 → 0.0046 이라 손해 (pose 관련 0.0107 → 0.0112).
 
 ### 실험 기록 (pose carrier, 64쌍)
 | 짝수 프레임 구성 | posenet_dist |
@@ -346,3 +355,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v6.14 | 0.000225 | 0.0000012 | 0.00428 | **0.1329** | 렌더러 ×2 사이클 3 (16.4KB, seg 0.0225) + 회색 기저 pose 재피팅 (항 0.0034). 160,616 B, inflate 410s + 평가 258s |
 | semantic_cpu v6.15 | 0.000225 | 0.0000012 | 0.00405 | **0.1271** | seg 코덱 A 패스 체커보드 분할 (스트림 120.2KB → 111.4KB) + 문맥 CNN float32 재양자화·channels_last (seg 디코드 251s → 126s). 152,010 B, inflate 278s + 평가 242s |
 | semantic_cpu v6.16 | 0.000225 | 0.0000012 | 0.00403 | **0.1267** | 문맥 모델 라운드 2 (모델+스트림 -631 B). 151,379 B, inflate 283s + 평가 255s |
+| semantic_cpu v6.17 | 0.000225 | 0.00000083 | 0.00401 | **0.1256** | 6층 문맥 모델 (-765 B) + pose 기저 이어 학습 (항 0.0034 → 0.0029). 150,586 B, inflate 288s + 평가 234s |
