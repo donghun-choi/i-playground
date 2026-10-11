@@ -88,10 +88,12 @@ def deepen_ctx(old: CtxNet, dils) -> CtxNet:
     convs_o = [m for m in old.net if isinstance(m, nn.Conv2d)]
     convs_n = [m for m in new.net if isinstance(m, nn.Conv2d)]
     j = 0
+    new.src = {}  # 새 conv 위치 → 옛 conv 위치 (self-compression 상태를 옮길 때)
     for i, cn in enumerate(convs_n[:-1]):
         if j < len(old.dils) and dils[i] == old.dils[j]:
             cn.weight.copy_(convs_o[j].weight)
             cn.bias.copy_(convs_o[j].bias)
+            new.src[i] = j
             j += 1
         else:
             cn.weight.zero_()
@@ -101,6 +103,7 @@ def deepen_ctx(old: CtxNet, dils) -> CtxNet:
     assert j == len(old.dils), "기존 dilation 이 순서대로 들어 있어야 한다"
     convs_n[-1].weight.copy_(convs_o[-1].weight)
     convs_n[-1].bias.copy_(convs_o[-1].bias)
+    new.src[len(convs_n) - 1] = len(convs_o) - 1
     return new
 
 
@@ -209,6 +212,12 @@ def main():
         if args.init and "sc" in ck and "float" in ck:  # self-compression 이어서: float 가중치 + 비트/스케일
             model.load_state_dict(pad_input(ck["float"], c_in))
             sc.load_state_dict(ck["sc"])
+        if args.deepen_from and "sc" in ckd:  # 옮겨 온 층은 비트/스케일도 그대로, 끼운 항등 층만 새로
+            with torch.no_grad():
+                for i, j in model.src.items():
+                    for kind in ("e", "b"):
+                        getattr(sc, kind)[f"net__{2 * i}__weight"].copy_(ckd["sc"][f"{kind}.net__{2 * j}__weight"])
+            print(f"self-compression 상태 {len(model.src)} 층 옮김", flush=True)
         # 손실 = 대상 칸당 nats. 스트림 전체 비트 ≈ 손실/ln2 × 부호화 칸 수 (601장 × 384·512) → 가중치 1비트와 같은 값으로
         gamma = args.self_compress * 0.75 * sc.total / (601 * SH * SW / math.log(2))
         if args.sc_rate == "laplace":
