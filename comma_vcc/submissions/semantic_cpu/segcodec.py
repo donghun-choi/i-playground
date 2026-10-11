@@ -8,7 +8,7 @@
   입력 x_q: 0..64 정수 (이진 채널은 0/64, 클래스 비율은 floor(count*64/h^2))
   층마다: acc = conv(x_q, W_q) (정확한 정수) → a_q = clamp(((acc + B_q) * M) >> S, 0, 255)  (ReLU 포함)
   마지막 층: logit_q = ((acc + B_q) * M) >> S  (1/16 nat 단위)
-  확률: freq_c = EXP_TABLE[min(max_logit - logit_c, 255)]
+  확률: freq_c = EXP_TABLE[min(max_logit - logit_c, 255)]  (최대 빈도 2^15, wide 모델은 2^20: 확실한 칸의 바닥 비용이 -2.3%)
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ Q_IN = 64  # 입력 스케일
 LOGIT_UNIT = 16  # logit 1 nat = 16
 SHIFT = 16
 EXP_TABLE = np.array([max(1, round(32768 * math.exp(-d / LOGIT_UNIT))) for d in range(256)], dtype=np.int64)
+EXP_TABLE_WIDE = np.array([max(1, round(2**20 * math.exp(-d / LOGIT_UNIT))) for d in range(256)], dtype=np.int64)
 
 
 # ---------------------------------------------------------------- 입력
@@ -167,11 +168,13 @@ class FastInput:
 class QNet:
     """layers: [(W_q int (o,i,kh,kw), B_q int (o,), M int (o,), dil, relu)]  (padding = dil * (k//2))"""
 
-    def __init__(self, layers, f32: bool = False):
+    def __init__(self, layers, f32: bool = False, wide: bool = False):
         """f32: 재양자화를 float32 로 (빠른 경로, channels_last 합성곱). float64 와 값이 조금 다르지만
-        IEEE 덧셈·곱셈은 정확히 반올림되므로 기계와 무관하게 같다. 직렬화 때 첫 층 relu 바이트의 비트 1 로 기록."""
+        IEEE 덧셈·곱셈은 정확히 반올림되므로 기계와 무관하게 같다. 직렬화 때 첫 층 relu 바이트의 비트 1 로 기록.
+        wide: 확률표 최대 빈도 2^20 (EXP_TABLE_WIDE), 비트 2 로 기록."""
         self.layers = layers
         self.f32 = f32
+        self.wide = wide
         self.c_in = layers[0][0].shape[1]
         self.passes = PASSES[self.c_in]
         # float32 합성곱이 정확하려면 모든 부분합의 절댓값이 2^24 미만이어야 한다
@@ -245,7 +248,8 @@ class QNet:
         out = [struct.pack("<B", len(self.layers))]
         for li, (W, B, M, dil, relu) in enumerate(self.layers):
             o, i, k, _ = W.shape
-            out.append(struct.pack("<HHBBB", o, i, k, dil, int(relu) | (2 if self.f32 and li == 0 else 0)))
+            flags = ((2 if self.f32 else 0) | (4 if self.wide else 0)) if li == 0 else 0
+            out.append(struct.pack("<HHBBB", o, i, k, dil, int(relu) | flags))
             out.append(W.astype(np.int8).tobytes())
             out.append(B.astype(np.int32).tobytes())
             out.append(M.astype(np.int32).tobytes())
@@ -255,11 +259,11 @@ class QNet:
     def from_bytes(cls, buf: bytes, off: int = 0):
         (n,) = struct.unpack_from("<B", buf, off)
         off += 1
-        layers, f32 = [], False
+        layers, f32, wide = [], False, False
         for li in range(n):
             o, i, k, dil, relu = struct.unpack_from("<HHBBB", buf, off)
             if li == 0:
-                f32, relu = bool(relu & 2), relu & 1
+                f32, wide, relu = bool(relu & 2), bool(relu & 4), relu & 1
             dil = max(dil, 1)  # 예전 형식은 1x1 층에 0 (padding) 을 적었다
             off += 7
             W = np.frombuffer(buf, np.int8, o * i * k * k, off).reshape(o, i, k, k).astype(np.int64)
@@ -269,11 +273,11 @@ class QNet:
             M = np.frombuffer(buf, np.int32, o, off).astype(np.int64)
             off += 4 * o
             layers.append((W, B, M, dil, bool(relu)))
-        return cls(layers, f32), off
+        return cls(layers, f32, wide), off
 
 
 def quantize_ctxnet(state_dict: dict, calib_inputs: list[np.ndarray], wbits: int = 8, dils=None, wq: dict | None = None,
-                    f32: bool = False) -> QNet:
+                    f32: bool = False, wide: bool = False) -> QNet:
     """float CtxNet (Conv-ReLU 반복 + 마지막 1x1) → QNet. calib_inputs: build_input_q 결과 몇 개.
 
     wq: 층 이름 → (정수 가중치, 출력 채널별 스케일). 주면 그 양자화를 그대로 쓴다 (self-compression 학습 결과).
@@ -309,25 +313,26 @@ def quantize_ctxnet(state_dict: dict, calib_inputs: list[np.ndarray], wbits: int
         layers.append((W_q.numpy().astype(np.int64), B_q.numpy().astype(np.int64), M.numpy().astype(np.int64), dil, not last))
         x_float = [y for y in ys] if not last else x_float
         s_in = s_out
-    return QNet(layers, f32)
+    return QNet(layers, f32, wide)
 
 
-def probs_from_logits(logit_q: np.ndarray) -> np.ndarray:
+def probs_from_logits(logit_q: np.ndarray, table: np.ndarray = EXP_TABLE) -> np.ndarray:
     """(n,5) 정수 logit → (n,5) float64 확률 (정수 빈도의 정확한 나눗셈)."""
     logit_q = np.ascontiguousarray(logit_q)
     d = np.minimum(logit_q.max(1, keepdims=True) - logit_q, 255)
-    f = EXP_TABLE[d].astype(np.float64)
+    f = table[d].astype(np.float64)
     # constriction 은 stride 를 무시하고 메모리를 그대로 읽는다 → 반드시 C 연속 배열로 넘긴다
     return np.ascontiguousarray(f / f.sum(1, keepdims=True))
 
 
 _EXP_T = torch.from_numpy(EXP_TABLE.astype(np.float64))
+_EXP_T_WIDE = torch.from_numpy(EXP_TABLE_WIDE.astype(np.float64))
 
 
-def probs_from_logits_t(logit: torch.Tensor) -> np.ndarray:
+def probs_from_logits_t(logit: torch.Tensor, table: torch.Tensor = _EXP_T) -> np.ndarray:
     """probs_from_logits 와 같은 값 (torch, 멀티스레드). logit: (n,5) 정수값 텐서."""
     d = (logit.amax(1, keepdim=True) - logit).clamp_(max=255).long()
-    f = _EXP_T[d]
+    f = table[d]
     return (f / f.sum(1, keepdim=True)).contiguous().numpy()
 
 
@@ -392,7 +397,7 @@ def encode(seg: np.ndarray, qnet: QNet, chunk: int = 16) -> bytes:
             enc.encode(sym, fam, cm.probs(cctx))
             cm.update(cctx, sym)
             for lt, sy in per_pass:
-                enc.encode(np.ascontiguousarray(sy[j]), fam, probs_from_logits(lt[j]))
+                enc.encode(np.ascontiguousarray(sy[j]), fam, probs_from_logits(lt[j], EXP_TABLE_WIDE if qnet.wide else EXP_TABLE))
     words = enc.get_compressed()
     return struct.pack("<I", n) + words.tobytes()
 
@@ -427,7 +432,7 @@ def decode(buf: bytes, qnet: QNet, progress=None) -> np.ndarray:
                 for kind in qnet.passes:
                     _, tg = fi.known[h, kind]
                     logit = qnet.run(fi.build(cur, s, kind, fp, fp2, bf))[0]  # (5,gh,gw)
-                    p = probs_from_logits_t(logit[:, tg].T)
+                    p = probs_from_logits_t(logit[:, tg].T, _EXP_T_WIDE if qnet.wide else _EXP_T)
                     g = cur[0, ::h, ::h]  # view
                     g[tg] = torch.from_numpy(dec.decode(fam, p).astype(np.uint8))
             cache[t] = fi.fracs(cur, 1)
