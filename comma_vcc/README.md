@@ -35,7 +35,7 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.18, 점수 0.1255)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.19, 점수 0.1239)
 
 ```
 archive (161KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (120KB) + 렌더러 (17KB, 폭 24·32·40, 채널별 학습 비트, 215/251 채널) + pose (11KB, 회색 기저 8개 5비트, 계수 8비트 Rice 부호)
@@ -163,6 +163,8 @@ cd comma_vcc/lab
 # v6.18: pose 를 같은 렌더러에서 한 번 더 이어서
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_sc7g2_gray2.bin --renderer ../cache/renderer_c8_sc7g2.pt --renderer-cfg 24,32,40 --rbits 0 --cbits 8 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_sc7g2_gray3.bin
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sa6c.pt --cbits 5 --ctx-f32 --renderer ../cache/renderer_c8_sc7g2.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc7g2_gray3.bin --segs ../cache/segs_pre_sa6c.bin --wec
+# v6.19: 확률표 최대 빈도 2^20 (모델은 그대로, 스트림만 다시 인코드)
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sa6c.pt --cbits 5 --ctx-f32 --wide-probs --renderer ../cache/renderer_c8_sc7g2.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_sc7g2_gray3.bin --wec
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -370,3 +372,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v6.16 | 0.000225 | 0.0000012 | 0.00403 | **0.1267** | 문맥 모델 라운드 2 (모델+스트림 -631 B). 151,379 B, inflate 283s + 평가 255s |
 | semantic_cpu v6.17 | 0.000225 | 0.00000083 | 0.00401 | **0.1256** | 6층 문맥 모델 (-765 B) + pose 기저 이어 학습 (항 0.0034 → 0.0029). 150,586 B, inflate 288s + 평가 234s |
 | semantic_cpu v6.18 | 0.000225 | 0.00000076 | 0.00401 | **0.1255** | pose 기저 한 번 더 이어 학습 (항 0.0028). 150,569 B, inflate 256s + 평가 221s |
+| semantic_cpu v6.19 | 0.000225 | 0.00000076 | 0.00395 | **0.1239** | seg 확률표 최대 빈도 2^15 → 2^20 (스트림 -2,352 B). pose 이어 학습 4회차는 3회차와 같아서 (d 7.7e-7) 3회차 사용. 148,217 B, inflate 307s + 평가 250s |
