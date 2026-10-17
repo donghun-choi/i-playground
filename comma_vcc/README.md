@@ -35,7 +35,7 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.21, 점수 0.1234)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.22, 점수 0.1230)
 
 ```
 archive (161KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (120KB) + 렌더러 (17KB, 폭 24·32·40, 채널별 학습 비트, 215/251 채널) + pose (11KB, 회색 기저 8개 5비트, 계수 8비트 Rice 부호)
@@ -176,6 +176,11 @@ cd comma_vcc/lab
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_pc_gray2.bin --renderer ../cache/renderer_c8_sc7g2pe.pt --renderer-cfg 24,32,40 --rbits 0 --cbits 8 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_pe_gray.bin
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_pe_gray.bin --renderer ../cache/renderer_c8_sc7g2pe.pt --renderer-cfg 24,32,40 --rbits 0 --cbits 8 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_pe_gray2.bin
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sa6c.pt --cbits 5 --ctx-f32 --wide-probs --renderer ../cache/renderer_c8_sc7g2pe.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_pe_gray2.bin --wec
+# v6.22: 문맥 모델 낮은 lr 다듬기 두 번 (sa6c → p1 → p4) + pose 한 번 더 이어서 (pe_gray2 → pe_gray3)
+../.venv/bin/python ctxmodel.py --init ../cache/ctxnet_c24sa6c.pt --split-a --ch 24 --layers 6 --dils 1,2,4,8,2,1 --self-compress 1.0 --sc-rate laplace --sc-init-bits 5 --steps 20000 --sc-lr 0 --lr 5e-5 --threads 1 --out ../cache/ctxnet_c24sa6p1.pt
+../.venv/bin/python ctxmodel.py --init ../cache/ctxnet_c24sa6p1.pt --split-a --ch 24 --layers 6 --dils 1,2,4,8,2,1 --self-compress 1.0 --sc-rate laplace --sc-init-bits 5 --steps 20000 --sc-lr 0 --lr 2e-5 --threads 1 --out ../cache/ctxnet_c24sa6p4.pt
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_pe_gray2.bin --renderer ../cache/renderer_c8_sc7g2pe.pt --renderer-cfg 24,32,40 --rbits 0 --cbits 8 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_pe_gray3.bin
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sa6p4.pt --cbits 5 --ctx-f32 --wide-probs --renderer ../cache/renderer_c8_sc7g2pe.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_pe_gray3.bin --wec
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -329,6 +334,9 @@ CPU 로는 렌더러 flip 학습 1에폭이 약 8분이라, 같은 레시피를 
   렌더러가 조금만 바뀌어도 기존 pose 는 d 7.6e-7 → 0.159 로 무너져서 다시 맞춰야 한다.
   격자를 고정한 다듬기에서는 크기 손실을 약하게 하는 편이 낫다: pc 에서 ×1 → 0.000220, 16,399 B (0.03292), ×0.5 → 0.000220, 16,448 B.
   pe 에서 한 번 더 (×1 / ×0.5, 시드 3) 도 0.000220 이라 여기서 수렴.
+- (v6.22) 문맥 모델도 낮은 lr 로 다듬기 (20000스텝씩, `--sc-lr 0` 이지만 OneCycle 이 모든 그룹에 같은 max_lr 을 주므로 비트·스케일도 같은 lr 로 조금 움직인다):
+  sa6c → lr 5e-5 (-236 B) → lr 2e-5 (-354 B), 합 모델+스트림 120,964 → 120,374 B. lr 1.5e-4 는 +21 B, 2e-5 에서 한 번 더 (1e-5 / 2e-5) 는 +140 / +51 B 로 수렴.
+  pose 를 pe 렌더러에서 한 번 더 이어서: d 7.6e-7 → 7.3e-7 (항 0.0028 → 0.0027).
 - 엔트로피 부호 세부: 가중치에 0 확률을 따로 두는 분포 (렌더러 가중치 64% 가 0) 는 행별 라플라스와 같거나 나쁨,
   stride-32 격자 카운트 문맥에 '이전 프레임 3×3 이웃이 모두 같은지' 를 더하면 1,627 → 1,528 B, 첫 쌍용 맵의 순비용은 184 B — 모두 작아서 안 넣음.
 - pose 기저를 QAT 로 학습할 때 에폭별 평가가 float 기저를 써서 0번 차원이 엉뚱하게 크게 보였다 (실제 학습은 정상). 저장 격자 기저로 재도록 고침.
@@ -396,3 +404,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v6.19 | 0.000225 | 0.00000076 | 0.00395 | **0.1239** | seg 확률표 최대 빈도 2^15 → 2^20 (스트림 -2,352 B). pose 이어 학습 4회차는 3회차와 같아서 (d 7.7e-7) 3회차 사용. 148,217 B, inflate 307s + 평가 250s |
 | semantic_cpu v6.20 | 0.000222 | 0.00000081 | 0.00395 | **0.1237** | 렌더러 격자 고정 다듬기 (seg 0.0225 → 0.0222, -69 B) + pose 재피팅 두 번 (항 0.0033 → 0.0029). 148,123 B, inflate 310s + 평가 258s |
 | semantic_cpu v6.21 | 0.000220 | 0.00000076 | 0.00395 | **0.1234** | 렌더러 다듬기 크기 손실 ×1 (seg 0.0222 → 0.0220, +38 B) + pose 재피팅 두 번 (항 0.0030 → 0.0028). 148,179 B, inflate 345s + 평가 275s |
+| semantic_cpu v6.22 | 0.000220 | 0.00000073 | 0.00393 | **0.1230** | 문맥 모델 낮은 lr 다듬기 (모델+스트림 -590 B) + pose 한 번 더 이어서 (항 0.0027). 147,582 B, inflate 267s + 평가 232s |
