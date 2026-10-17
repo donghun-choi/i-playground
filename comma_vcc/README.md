@@ -35,7 +35,7 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.22, 점수 0.1230)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.23, 점수 0.1205)
 
 ```
 archive (161KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (120KB) + 렌더러 (17KB, 폭 24·32·40, 채널별 학습 비트, 215/251 채널) + pose (11KB, 회색 기저 8개 5비트, 계수 8비트 Rice 부호)
@@ -181,6 +181,15 @@ cd comma_vcc/lab
 ../.venv/bin/python ctxmodel.py --init ../cache/ctxnet_c24sa6p1.pt --split-a --ch 24 --layers 6 --dils 1,2,4,8,2,1 --self-compress 1.0 --sc-rate laplace --sc-init-bits 5 --steps 20000 --sc-lr 0 --lr 2e-5 --threads 1 --out ../cache/ctxnet_c24sa6p4.pt
 ../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_pe_gray2.bin --renderer ../cache/renderer_c8_sc7g2pe.pt --renderer-cfg 24,32,40 --rbits 0 --cbits 8 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_pe_gray3.bin
 ../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sa6p4.pt --cbits 5 --ctx-f32 --wide-probs --renderer ../cache/renderer_c8_sc7g2pe.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_pe_gray3.bin --wec
+# v6.23: 렌더러 다듬기를 flip 손실 처음부터 sigmoid + 날카로운 τ 로 네 번 (pe → pj → pk → pm → pp) + pose 재피팅 두 번
+R="--widths 24,32,40 --epochs 5 --lr 3e-5 --sc-lr 0 --bs 4 --cosine --fp32 --bits 4 --self-compress 1.0 --sc-rate laplace --loss flip --flip-start 0 --full-eval"
+../.venv/bin/python renderer.py $R --resume ../cache/renderer_c8_sc7g2pe.pt --seed 4 --tau 0.06,0.02 --out ../cache/renderer_c8_sc7g2pj.pt
+../.venv/bin/python renderer.py $R --resume ../cache/renderer_c8_sc7g2pj.pt --seed 5 --tau 0.04,0.01 --out ../cache/renderer_c8_sc7g2pk.pt
+../.venv/bin/python renderer.py $R --resume ../cache/renderer_c8_sc7g2pk.pt --seed 6 --tau 0.03,0.01 --out ../cache/renderer_c8_sc7g2pm.pt
+../.venv/bin/python renderer.py $R --resume ../cache/renderer_c8_sc7g2pm.pt --seed 7 --tau 0.03,0.01 --out ../cache/renderer_c8_sc7g2pp.pt
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_pe_gray3.bin --renderer ../cache/renderer_c8_sc7g2pp.pt --renderer-cfg 24,32,40 --rbits 0 --cbits 8 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_pp_gray.bin
+../.venv/bin/python pose_refine.py --pose2 ../cache/pose2_pp_gray.bin --renderer ../cache/renderer_c8_sc7g2pp.pt --renderer-cfg 24,32,40 --rbits 0 --cbits 8 --epochs 150 --lr 0.01 --train-b 0.01 --bbits 5 --b-qat --dimw 1.0 --plain-epochs 30 --q-epochs 10 --greedy-rounds 3 --qf --out ../cache/pose2_pp_gray2.bin
+../.venv/bin/python build_archive.py --ctx ../cache/ctxnet_c24sa6p4.pt --cbits 5 --ctx-f32 --wide-probs --renderer ../cache/renderer_c8_sc7g2pp.pt --renderer-cfg 24,32,40 --rbits 0 --pose2 ../cache/pose2_pp_gray2.bin --wec
 cd .. && bash run.sh semantic_cpu
 ```
 
@@ -410,3 +419,4 @@ pose 기저를 다시 학습할 때: B 만 학습시키면 (일반 MSE) 회전 �
 | semantic_cpu v6.20 | 0.000222 | 0.00000081 | 0.00395 | **0.1237** | 렌더러 격자 고정 다듬기 (seg 0.0225 → 0.0222, -69 B) + pose 재피팅 두 번 (항 0.0033 → 0.0029). 148,123 B, inflate 310s + 평가 258s |
 | semantic_cpu v6.21 | 0.000220 | 0.00000076 | 0.00395 | **0.1234** | 렌더러 다듬기 크기 손실 ×1 (seg 0.0222 → 0.0220, +38 B) + pose 재피팅 두 번 (항 0.0030 → 0.0028). 148,179 B, inflate 345s + 평가 275s |
 | semantic_cpu v6.22 | 0.000220 | 0.00000073 | 0.00393 | **0.1230** | 문맥 모델 낮은 lr 다듬기 (모델+스트림 -590 B) + pose 한 번 더 이어서 (항 0.0027). 147,582 B, inflate 267s + 평가 232s |
+| semantic_cpu v6.23 | 0.000194 | 0.00000076 | 0.00393 | **0.1205** | 렌더러 다듬기 flip 손실 처음부터 sigmoid + 날카로운 τ (seg 0.0220 → 0.0194) + pose 재피팅 두 번 (항 0.0028). 147,609 B, inflate 323s + 평가 274s |
