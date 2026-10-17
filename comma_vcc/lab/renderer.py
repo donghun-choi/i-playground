@@ -85,6 +85,8 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0, help="학습 순서·무작위 시드 (사이클을 다른 경로로 다시 돌릴 때)")
+    ap.add_argument("--flip-start", type=float, default=0.5, help="flip 손실에서 sigmoid 단계가 시작하는 진행률 (앞은 softplus)")
+    ap.add_argument("--tau", default="0.15,0.05", help="flip 손실 sigmoid 단계의 τ 시작,끝 (선형)")
     ap.add_argument("--out", default=str(CACHE / "renderer.pt"))
     ap.add_argument("--resume", default=None)
     ap.add_argument("--port", type=int, default=None)
@@ -185,10 +187,12 @@ def main():
             margin = true - other
             if args.loss == "flip":
                 prog = step / max(steps - 1, 1)
-                if prog < 0.5:
+                if prog < args.flip_start:
                     loss = (F.softplus(-margin / 0.2) * 0.2).mean()
                 else:
-                    loss = torch.sigmoid(-margin / (0.15 - 0.2 * (prog - 0.5))).mean()
+                    t0_, t1_ = (float(v) for v in args.tau.split(","))
+                    frac = (prog - args.flip_start) / max(1 - args.flip_start, 1e-6)
+                    loss = torch.sigmoid(-margin / (t0_ + (t1_ - t0_) * frac)).mean()
             else:
                 # argmax 를 뒤집는 데 직접 관여하는 margin 손실: 정답 logit 이 다른 것보다 2 이상 크게
                 loss = F.cross_entropy(logits, m) + F.relu(2.0 - margin).mean()
