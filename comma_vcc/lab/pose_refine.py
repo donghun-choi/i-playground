@@ -1,9 +1,11 @@
-"""pose v2 쌍별 파라미터 다듬기: 기저 B 고정, 쌍들을 고정 배치로 나눠 배치마다 따로 Adam → 매 에폭 모든 쌍이 한 번씩 갱신.
+"""pose 다듬기 (pose2 blob → pose2 blob): 쌍들을 고정 배치로 나눠 배치마다 따로 Adam → 매 에폭 모든 쌍이 한 번씩 갱신.
 
 (전체 피팅에서는 배치가 무작위라 쌍마다 25스텝에 한 번만 그래디언트를 받아 수렴이 느렸다.)
-마지막에 격자 양자화 + STE 미세조정 + ±1 탐욕 탐색, 평가 경로로 확인.
+  본 학습 (--epochs, --train-b 면 공유 기저 B 도, --dimw 차원별 가중) → B 를 --bbits 격자로 고정
+  → (--plain-epochs) 일반 MSE → 계수 격자 양자화 + STE 미세조정 (--q-epochs) → ±1 탐욕 탐색 → 평가 경로로 확인.
+--qf: 학습/탐욕 탐색을 평가 경로 (서브픽셀 정수화 후 축소) 근사로. 최종 레시피는 GUIDE.md.
 
-    python pose_refine.py --pose2 ../cache/pose2_v1r.bin --renderer ../cache/renderer_v1.pt --rbits 6 --out ../cache/pose2_v1r_ref.bin
+    python pose_refine.py --pose2 ../cache/pose2.bin --renderer ../cache/renderer.pt --renderer-cfg 24,32,40 --rbits 0 --out ../cache/pose2_r.bin
 """
 
 from __future__ import annotations
@@ -15,11 +17,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from common import CACHE, SH, SW, downsample, fine_q, fine_q_ste, load_gt, nets, pose_out, setup_device
-import archive  # noqa: E402
-from model import parse_rcfg  # noqa: E402
-from model import even_frames_prev, expand_fine  # noqa: E402
+from common import CACHE, SH, SW, downsample, fine_q, fine_q_ste, load_gt, nets, parse_widths, pose_out, setup_device
+from model import even_frames, expand_fine  # noqa: E402
 from pose_fit import renders
+from posefmt import pack_pose2, pose2_to_pose4, read_pose2, unpack_pose2
 
 
 def main():
@@ -64,13 +65,12 @@ def main():
     wdim = target.var(0) ** (-args.dimw)
     wdim = wdim / wdim.mean()
     pre = np.load(CACHE / "seg_pre.npy")
-    cfg = parse_rcfg(args.renderer_cfg, n)
     t0 = time.time()
-    odd, prev = renders(args.renderer, cfg, seg, pre, args.rbits, device=dev)
+    odd, prev = renders(args.renderer, parse_widths(args.renderer_cfg), seg, pre, args.rbits, device=dev)
     odd_in = fine_q(odd) if args.qf else odd  # PoseNet 에 들어가는 홀수 프레임 (prev 는 inflate 처럼 float 렌더)
     evq = fine_q_ste if args.qf else (lambda x: x)
     blob = open(args.pose2, "rb").read()
-    pos = archive.unpack_pose2(blob)
+    pos = unpack_pose2(blob)
     if args.keep_k:
         assert args.train_b > 0 and not args.keep_grid, "--keep-k 는 기저를 다시 저장해야 하고 (--train-b) 격자도 새로 잡는다"
         imp = pos["c"].square().mean(0) * pos["B"].square().sum((1, 2, 3))
@@ -101,7 +101,7 @@ def main():
     def evaluate(a, c):
         with torch.inference_mode():
             Be = fq_b(B.detach()) if (args.b_qat and B.requires_grad) else B.detach()  # 학습 중인 기저는 저장될 격자로 (float 로 재면 엉뚱한 값)
-            return torch.cat([pose_out(net, evq(even_frames_prev(prev[b], a[j], c[j], Be)), odd_in[b]) for j, b in enumerate(batches)]) - target
+            return torch.cat([pose_out(net, evq(even_frames(prev[b], a[j], c[j], Be)), odd_in[b]) for j, b in enumerate(batches)]) - target
 
     state_path = args.out + ".state.pt"
 
@@ -124,7 +124,7 @@ def main():
                 train_b = opt_B is not None and q is None and with_b
                 a, c = (A[j], C[j]) if q is None else q(A[j], C[j])
                 Bf = (fq_b(B) if args.b_qat else B) if train_b else B.detach()
-                out = pose_out(net, evq(even_frames_prev(prev[b], a, c, Bf)), odd_in[b])
+                out = pose_out(net, evq(even_frames(prev[b], a, c, Bf)), odd_in[b])
                 sq = (out - target[b]) ** 2
                 loss = (sq * wdim).sum() if (q is None and weighted) else sq.sum()
                 opts[j].zero_grad()
@@ -179,10 +179,9 @@ def main():
         a_step = (a_all.amax(0) - a_all.amin(0)).clamp_min(1e-6) * 1.2 / 2**args.cbits
         c_step = (c_all.amax(0) - c_all.amin(0)).clamp_min(1e-6) * 1.2 / 2**args.cbits
         if args.keep_grid:
-            kk = pos["c"].shape[1]
-            hdr = archive.unxz(blob[archive.struct.calcsize("<HHBHH"):])
-            c_step = torch.from_numpy(np.frombuffer(hdr, np.float32, kk, 0).copy()).to(dev)
-            a_step = torch.from_numpy(np.frombuffer(hdr, np.float32, 6, 4 * kk).copy()).to(dev)
+            raw = read_pose2(blob)
+            c_step = torch.from_numpy(raw["c_step"].copy()).to(dev)
+            a_step = torch.from_numpy(raw["a_step"].copy()).to(dev)
 
     def q(a, c):
         return a + ((a / a_step).round() * a_step - a).detach(), c + ((c / c_step).round() * c_step - c).detach()
@@ -211,31 +210,25 @@ def main():
                         d[better] = dn[better]
             print(f"탐욕 탐색 {rnd + 1}: posenet_dist {d.mean().item():.7f} term {np.sqrt(10 * d.mean().item()):.4f} ({time.time() - t0:.0f}s)", flush=True)
 
-    # B 는 원래 blob 의 정수 그대로 다시 쓴다
-    import struct
-
-    nn_, k, Cc, bh, bw = struct.unpack_from("<HHBHH", blob, 0)
-    body = archive.unxz(blob[struct.calcsize("<HHBHH"):])
-    B_scale = np.frombuffer(body, np.float32, k, 4 * (k + 6))
-    B_q = np.frombuffer(body, np.int8, k * Cc * bh * bw, 4 * (2 * k + 6)).reshape(k, Cc, bh, bw)
-    if B_new is not None:
-        B_q, B_scale = B_new
-    out = archive.pack_pose2(B_q, B_scale, c_int.cpu().numpy().astype(np.int64), c_step.cpu().numpy(), a_int.cpu().numpy().astype(np.int64), a_step.cpu().numpy())
+    # B 를 학습하지 않았으면 원래 blob 의 정수 그대로 다시 쓴다
+    raw = read_pose2(blob)
+    B_q, B_scale = B_new if B_new is not None else (raw["B_q"], raw["B_scale"])
+    out = pack_pose2(B_q, B_scale, c_int.cpu().numpy().astype(np.int64), c_step.cpu().numpy(), a_int.cpu().numpy().astype(np.int64), a_step.cpu().numpy())
     open(args.out, "wb").write(out)
-    pos2 = archive.unpack_pose2(out)
+    pos2 = unpack_pose2(out)
     assert torch.allclose(pos2["B"], B.cpu())
     pos2 = {k: v.to(dev) for k, v in pos2.items()}
     dd = []
     with torch.inference_mode():
         for i in range(0, n, 20):
-            e = even_frames_prev(prev[i : i + 20], pos2["a"][i : i + 20], pos2["c"][i : i + 20], pos2["B"])
+            e = even_frames(prev[i : i + 20], pos2["a"][i : i + 20], pos2["c"][i : i + 20], pos2["B"])
             pair = torch.stack([e, odd[i : i + 20]], 1).flatten(0, 1).permute(0, 2, 3, 1).cpu().numpy()
             back = downsample(torch.from_numpy(expand_fine(pair))).view(-1, 2, 3, SH, SW).to(dev)
             dd.append(((pose_out(net, back[:, 0], back[:, 1]) - target[i : i + 20]) ** 2).mean(1))
     d2 = torch.cat(dd).mean().item()
-    n3 = len(archive.pose2_to_pose3(out))
-    print(f"pose2 {len(out):,} B (pos3 {n3:,} B), 평가 경로 posenet_dist {d2:.4e} term {np.sqrt(10 * d2):.4f}"
-          f" → pose 관련 점수 {np.sqrt(10 * d2) + 25 * n3 / 37_545_489:.4f} ({time.time() - t0:.0f}s)", flush=True)
+    n4 = len(pose2_to_pose4(out))
+    print(f"pose2 {len(out):,} B (pos4 {n4:,} B), 평가 경로 posenet_dist {d2:.4e} term {np.sqrt(10 * d2):.4f}"
+          f" → pose 관련 점수 {np.sqrt(10 * d2) + 25 * n4 / 37_545_489:.4f} ({time.time() - t0:.0f}s)", flush=True)
 
 
 if __name__ == "__main__":

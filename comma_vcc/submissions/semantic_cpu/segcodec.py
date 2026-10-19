@@ -1,14 +1,14 @@
-"""seg 맵 무손실 코덱 (제출물에 그대로 들어가는 자체 완결 모듈: numpy, torch, constriction 만 사용).
+"""seg 맵 무손실 코덱: 계층 순서 + 정수 문맥 CNN + range coder (numpy, torch, constriction 만 사용).
 
-순서: 프레임마다 stride-32 격자(coarse) → 레벨 s=32..2 에서 A 패스, B 패스.
-      입력 23채널 모델은 A 를 체커보드로 A1 → A2 로 나눈다. 24채널은 A1 도 둘로 (PASSES).
-확률: coarse 는 적응형 정수 카운트, 나머지는 정수 CNN (float64 로 계산하지만 값이 전부 정수라 결과가 기계와 무관).
-
-정수 CNN 규약
-  입력 x_q: 0..64 정수 (이진 채널은 0/64, 클래스 비율은 floor(count*64/h^2))
-  층마다: acc = conv(x_q, W_q) (정확한 정수) → a_q = clamp(((acc + B_q) * M) >> S, 0, 255)  (ReLU 포함)
-  마지막 층: logit_q = ((acc + B_q) * M) >> S  (1/16 nat 단위)
-  확률: freq_c = EXP_TABLE[min(max_logit - logit_c, 255)]  (최대 빈도 2^15, wide 모델은 2^20: 확실한 칸의 바닥 비용이 -2.3%)
+프레임 t (0..n-1, 0 은 첫 쌍의 '이전 프레임' 용 맵) 하나의 부호화 순서
+  1. stride-32 격자 12x16 칸: 적응형 카운트 (문맥 = 이전 맵의 같은 칸)
+  2. 레벨 s = 32, 16, 8, 4, 2 마다 stride-h 격자 (h = s/2, 격자점 (i,j) = 픽셀 (i·h, j·h)) 에서 세 패스
+       A1: (홀,홀) 칸 중 i ≡ j (mod 4)    아는 칸: (짝,짝)
+       A2: 나머지 (홀,홀) 칸               아는 칸: (짝,짝) + A1
+       B : 한쪽만 홀수인 칸                아는 칸: (짝,짝) + (홀,홀)
+     패스 안의 칸들은 서로를 문맥으로 쓰지 않는다 → 한 번의 CNN 으로 패스 전체의 확률이 나온다.
+확률은 정수 문맥 CNN (QNet) 의 logit → 정수 빈도표 → 정확한 나눗셈. 모든 값이 기계와 무관하게 같도록 짰다.
+형식 명세: comma_vcc/GUIDE.md
 """
 
 from __future__ import annotations
@@ -22,250 +22,150 @@ import torch.nn.functional as F
 
 SH, SW = 384, 512
 LEVELS = [32, 16, 8, 4, 2]
-K = 5
-C_IN = 22
-# 입력 채널 수 → 레벨마다 패스 순서와 추가 입력 채널 (그 패스일 때 64). 23: A 를 체커보드로 A1 → A2 (A2 는 A1 을 안다).
-# 24: 23 + 양방향 프레임 순서 (짝수 번째 맵을 먼저 2칸 전 문맥으로, 홀수 번째 맵은 앞뒤 맵을 문맥으로; 마지막 채널 = B 프레임 표시).
-# (B 를 B1 → B2 로, A1 을 A11 → A12 로 더 나누는 것은 비트가 그대로라 뺐다.)
-PASSES = {22: ("A", "B"), 23: ("A1", "A2", "B"), 24: ("A1", "A2", "B")}
-EXTRA = {22: (), 23: ("A2",), 24: ("A2",)}
-BIDIR = {24}
-
-
-def ctx_index(t: int, n: int, bidir: bool):
-    """프레임 t 의 문맥 프레임 번호 (prev, prev2), 없으면 None. 양방향: 짝수 t 는 (t-2, t-4), 홀수 t 는 (t-1, t+1)."""
-    a, b = (t - 1, t - 2) if not bidir else (t - 2, t - 4) if t % 2 == 0 else (t - 1, t + 1)
-    return (a if 0 <= a < n else None), (b if 0 <= b < n else None)
-
-
-def coding_order(n: int, bidir: bool) -> list[int]:
-    """부호화/복호화 순서. 양방향: 0, 2, 1, 4, 3, ... (홀수 t 앞에 t+1 이 온다)."""
-    if not bidir:
-        return list(range(n))
-    order = [0]
-    for t in range(2, n, 2):
-        order += [t, t - 1]
-    if n % 2 == 0:
-        order.append(n - 1)
-    return order
-Q_IN = 64  # 입력 스케일
+PASSES = ("A1", "A2", "B")
+HS = [s // 2 for s in LEVELS]  # 레벨별 격자 간격
+K = 5  # 클래스 수
+C_IN = 23  # 문맥 CNN 입력 채널
+Q_IN = 64  # 입력값 1.0 = 64
+SHIFT = 16  # 재양자화 배율 M 의 소수 비트
 LOGIT_UNIT = 16  # logit 1 nat = 16
-SHIFT = 16
-EXP_TABLE = np.array([max(1, round(32768 * math.exp(-d / LOGIT_UNIT))) for d in range(256)], dtype=np.int64)
-EXP_TABLE_WIDE = np.array([max(1, round(2**20 * math.exp(-d / LOGIT_UNIT))) for d in range(256)], dtype=np.int64)
+FLAGS = 6  # QNet 바이트 첫 층 relu 바이트의 비트 1 (float32 재양자화) | 비트 2 (빈도표 최대 2^20). 이 형식만 쓴다.
+# logit 이 최댓값보다 d 작은 클래스의 빈도 (최대 2^20, 최소 1)
+FREQ = torch.tensor([max(1, round(2**20 * math.exp(-d / LOGIT_UNIT))) for d in range(256)], dtype=torch.float64)
 
 
-# ---------------------------------------------------------------- 입력
-def onehot_np(m: np.ndarray) -> np.ndarray:
-    """(n,H,W) uint8 → (n,5,H,W) int64 0/1"""
-    return (m[:, None, :, :] == np.arange(K, dtype=m.dtype)[None, :, None, None]).astype(np.int64)
-
-
-def frac_q(m: np.ndarray | None, h: int, n: int) -> np.ndarray:
-    """h×h 블록의 클래스 개수 → floor(count*64/h^2). (n,5,SH/h,SW/h) int64"""
-    gh, gw = SH // h, SW // h
-    if m is None:
-        return np.zeros((n, K, gh, gw), np.int64)
-    oh = onehot_np(m)
-    cnt = oh.reshape(n, K, gh, h, gw, h).sum((3, 5))
-    return (cnt * Q_IN) // (h * h)
-
-
+# ---------------------------------------------------------------- 패스와 입력
 def masks(h: int, kind: str):
-    gi = (np.arange(SH // h) % 2)[:, None]
-    gj = (np.arange(SW // h) % 2)[None, :]
-    if kind == "A":
-        known, target = (gi == 0) & (gj == 0), (gi == 1) & (gj == 1)
-    elif kind == "B":
-        known, target = gi == gj, gi != gj
-    else:  # A1 / A2 / A11 / A12: A 칸 (홀,홀) 을 체커보드로 A1 → A2, A1 은 다시 (4i+1,4j+1) → (4i+3,4j+3)
-        base = (gi == 0) & (gj == 0)
-        a = (gi == 1) & (gj == 1)
-        ri, rj = (np.arange(SH // h) % 4)[:, None], (np.arange(SW // h) % 4)[None, :]
-        a11, a12 = (ri == 1) & (rj == 1), (ri == 3) & (rj == 3)
-        a1 = a11 | a12
-        known, target = {"A1": (base, a1), "A2": (base | a1, a & ~a1),
-                         "A11": (base, a11), "A12": (base | a11, a12)}[kind]
-    return known, target
+    """stride-h 격자에서 패스 kind 의 (아는 칸, 보낼 칸) bool 배열 (SH/h, SW/h)."""
+    i = np.arange(SH // h)[:, None]
+    j = np.arange(SW // h)[None, :]
+    even = (i % 2 == 0) & (j % 2 == 0)
+    odd = (i % 2 == 1) & (j % 2 == 1)
+    a1 = odd & (i % 4 == j % 4)
+    if kind == "A1":
+        return even, a1
+    if kind == "A2":
+        return even | a1, odd & ~a1
+    return even | odd, ~(even | odd)
 
 
-def build_input_q(cur: np.ndarray, prev, prev2, s: int, kind: str, c_in: int = C_IN, bframe: bool = False) -> np.ndarray:
-    """cur: (n,384,512) uint8 (target 칸은 아무 값이어도 됨). → (n,c_in,gh,gw) int64 (0..64)"""
-    h = s // 2
-    n = cur.shape[0]
-    g = cur[:, ::h, ::h]
-    known, _ = masks(h, kind)
-    gh, gw = known.shape
-    lvl = np.zeros((n, len(LEVELS), gh, gw), np.int64)
-    lvl[:, LEVELS.index(s)] = Q_IN
-    parts = [
-        onehot_np(g) * known * Q_IN,
-        np.broadcast_to(known * Q_IN, (n, 1, gh, gw)),
-        frac_q(prev, h, n),
-        frac_q(prev2, h, n),
-        np.full((n, 1, gh, gw), Q_IN if kind[0] == "A" else 0, np.int64),
-        lvl,
-    ]
-    for extra in EXTRA[c_in]:
-        parts.append(np.full((n, 1, gh, gw), Q_IN if kind == extra else 0, np.int64))
-    if c_in in BIDIR:
-        parts.append(np.full((n, 1, gh, gw), Q_IN if bframe else 0, np.int64))
-    return np.concatenate(parts, 1)
+class Inputs:
+    """문맥 CNN 입력 (n, 23, SH/h, SW/h) float32 (값은 0..64 정수).
 
+    채널: 현재 맵 one-hot × 아는 칸 (5) | 아는 칸 (1) | 이전 맵 클래스 비율 (5) | 전전 맵 클래스 비율 (5)
+          | A 패스 표시 (1) | 레벨 one-hot (5, LEVELS 순서) | A2 패스 표시 (1)     (표시 값은 64)
+    클래스 비율 = floor(h×h 블록 안 그 클래스 픽셀 수 × 64 / h²), 블록은 격자점이 왼쪽 위 모서리.
+    """
 
-class FastInput:
-    """build_input_q 와 같은 값을 torch float32 로 빠르게 만든다 (이전 프레임 비율은 프레임마다 한 번만 계산)."""
-
-    HS = [s // 2 for s in LEVELS]
-
-    def __init__(self, c_in: int = C_IN):
-        self.c_in = c_in
-        self.known = {}
-        for s in LEVELS:
-            h = s // 2
-            for kind in PASSES[c_in]:
+    def __init__(self):
+        self.known, self.target = {}, {}
+        for h in HS:
+            for kind in PASSES:
                 kn, tg = masks(h, kind)
-                self.known[h, kind] = (torch.from_numpy(kn).float(), torch.from_numpy(tg))
+                self.known[h, kind] = torch.from_numpy(kn).float()
+                self.target[h, kind] = torch.from_numpy(tg)
 
-    def fracs(self, m_t: torch.Tensor | None, n: int) -> dict:
-        """m_t: (n,H,W) uint8 → {h: (n,5,H/h,W/h) float32 = floor(count*64/h^2)} (없으면 0)"""
-        if m_t is None:
-            return {h: torch.zeros(n, K, SH // h, SW // h) for h in self.HS}
-        oh = F.one_hot(m_t.long(), K).permute(0, 3, 1, 2).float()
-        return {h: torch.floor((F.avg_pool2d(oh, h) if h > 1 else oh) * Q_IN) for h in self.HS}
-
-    def build(self, cur_t: torch.Tensor, s: int, kind: str, fp: dict, fp2: dict, bframe=None) -> torch.Tensor:
-        """bframe: 양방향 모드에서 프레임별 B 프레임 여부 (n,) bool 텐서 (없으면 전부 False)."""
-        h = s // 2
-        n = cur_t.shape[0]
-        kn, _ = self.known[h, kind]
-        gh, gw = kn.shape
-        g = cur_t[:, ::h, ::h]
-        oh = F.one_hot(g.long(), K).permute(0, 3, 1, 2).float() * (kn * Q_IN)
-        lvl = torch.zeros(n, len(LEVELS), gh, gw)
-        lvl[:, LEVELS.index(s)] = Q_IN
-        parts = [oh, (kn * Q_IN).expand(n, 1, gh, gw), fp[h], fp2[h],
-                 torch.full((n, 1, gh, gw), float(Q_IN if kind[0] == "A" else 0)), lvl]
-        for extra in EXTRA[self.c_in]:
-            parts.append(torch.full((n, 1, gh, gw), float(Q_IN if kind == extra else 0)))
-        if self.c_in in BIDIR:
-            bf = torch.zeros(n) if bframe is None else bframe.float()
-            parts.append((bf * Q_IN).view(n, 1, 1, 1).expand(n, 1, gh, gw))
-        return torch.cat(parts, 1)
+    @staticmethod
+    def fracs(m: torch.Tensor | None, n: int = 1, hs=HS) -> dict:
+        """맵 (n,SH,SW) uint8 → {h: (n,5,SH/h,SW/h) 클래스 비율}. 맵이 없으면 (None) 0."""
+        if m is None:
+            return {h: torch.zeros(n, K, SH // h, SW // h) for h in hs}
+        oh = F.one_hot(m.long(), K).permute(0, 3, 1, 2).float()
+        return {h: torch.floor((F.avg_pool2d(oh, h) if h > 1 else oh) * Q_IN) for h in hs}
 
     def ctx_fracs(self, seg_t: torch.Tensor, idx: list) -> dict:
-        """프레임 번호 목록 (None = 없음) → 그 맵들의 비율 (없는 칸은 0)."""
+        """프레임 번호 목록 (None = 없음) → 그 맵들의 비율을 쌓은 것 (없는 자리는 0)."""
         out = self.fracs(None, len(idx))
         valid = [i for i, k in enumerate(idx) if k is not None]
         if valid:
             f = self.fracs(seg_t[[idx[i] for i in valid]], len(valid))
-            for h in self.HS:
+            for h in HS:
                 out[h][valid] = f[h]
         return out
 
+    def build(self, cur: torch.Tensor, s: int, kind: str, fp: dict, fp2: dict) -> torch.Tensor:
+        """cur: (n,SH,SW) uint8 현재 맵 (보낼 칸은 아무 값이어도 된다), fp/fp2: 이전·전전 맵의 fracs."""
+        h = s // 2
+        n = cur.shape[0]
+        kn = self.known[h, kind]
+        gh, gw = kn.shape
+        g = cur[:, ::h, ::h]
+        lvl = torch.zeros(n, len(LEVELS), gh, gw)
+        lvl[:, LEVELS.index(s)] = Q_IN
 
-# ---------------------------------------------------------------- 정수 네트워크
+        def flag(on):
+            return torch.full((n, 1, gh, gw), float(Q_IN if on else 0))
+
+        onehot = F.one_hot(g.long(), K).permute(0, 3, 1, 2).float() * (kn * Q_IN)
+        return torch.cat([onehot, (kn * Q_IN).expand(n, 1, gh, gw), fp[h], fp2[h], flag(kind != "B"), lvl, flag(kind == "A2")], 1)
+
+
+# ---------------------------------------------------------------- 정수 문맥 CNN
 class QNet:
-    """layers: [(W_q int (o,i,kh,kw), B_q int (o,), M int (o,), dil, relu)]  (padding = dil * (k//2))"""
+    """layers: [(W 정수 (o,i,k,k), B 정수 (o,), M 정수 (o,), dilation, relu)], padding = dilation·(k//2).
 
-    def __init__(self, layers, f32: bool = False, wide: bool = False):
-        """f32: 재양자화를 float32 로 (빠른 경로, channels_last 합성곱). float64 와 값이 조금 다르지만
-        IEEE 덧셈·곱셈은 정확히 반올림되므로 기계와 무관하게 같다. 직렬화 때 첫 층 relu 바이트의 비트 1 로 기록.
-        wide: 확률표 최대 빈도 2^20 (EXP_TABLE_WIDE), 비트 2 로 기록."""
+    층마다  acc = conv(x, W)                                (정확한 정수: 모든 부분합이 2^24 미만이라 float32 합성곱이 정확)
+           y   = floor(f32(f32(acc + B) × f32(M · 2^-16)))   (덧셈·곱셈 각각 float32 IEEE 반올림 → 기계와 무관)
+           relu 층이면 y = clamp(y, 0, 255)
+    마지막 층 (relu 없음) 의 y 가 logit (1/16 nat 단위).
+    """
+
+    def __init__(self, layers):
         self.layers = layers
-        self.f32 = f32
-        self.wide = wide
-        self.c_in = layers[0][0].shape[1]
-        self.passes = PASSES[self.c_in]
-        # float32 합성곱이 정확하려면 모든 부분합의 절댓값이 2^24 미만이어야 한다
         in_max = Q_IN
-        for W, B, M, _, relu in layers:
-            assert in_max * np.abs(W).sum((1, 2, 3)).max() < 2**24, "float32 정확 범위 초과"
-            if f32:  # acc + B 와 M·2^-16 이 float32 에서 정확
-                assert in_max * np.abs(W).sum((1, 2, 3)).max() + np.abs(B).max() < 2**24 and np.abs(M).max() < 2**24
+        for W, B, M, _, _ in layers:
+            assert in_max * np.abs(W).sum((1, 2, 3)).max() + np.abs(B).max() < 2**24 and np.abs(M).max() < 2**24, "float32 정확 범위 초과"
             in_max = 255
         self._g = [(torch.from_numpy(W.astype(np.float32)).contiguous(memory_format=torch.channels_last),
                     torch.from_numpy(B.astype(np.float32)).view(1, -1, 1, 1),
                     torch.from_numpy((M * 2.0**-SHIFT).astype(np.float32)).view(1, -1, 1, 1), dil, relu)
                    for W, B, M, dil, relu in layers]
-        self._t = [(torch.from_numpy(W.astype(np.float32)), torch.from_numpy(B).view(1, -1, 1, 1),
-                    torch.from_numpy(M).view(1, -1, 1, 1), dil, relu) for W, B, M, dil, relu in layers]
-        # 재양자화를 float64 로: (acc + B) * M 은 2^53 보다 훨씬 작은 정수라 정확, 2^-16 곱도 정확 → floor 는 >> 와 같다
-        self._f = [(W, B.double(), M.double() * 2.0**-SHIFT, dil, relu) for W, B, M, dil, relu in self._t]
-        self.dtype = torch.float32
+        self.dtype = torch.float32  # 합성곱 dtype (self_check 가 실패하면 float64)
 
-    def self_check(self, x_q: np.ndarray) -> bool:
-        """이 기계의 float32 합성곱이 정확한지 float64 결과와 비교. 아니면 float64 로 전환.
-        f32 경로는 레벨마다 격자 크기가 달라 (합성곱 구현이 달라질 수 있어) 모든 크기에서 확인한다."""
-        if self.f32:
-            rng = np.random.default_rng(0)
-            xs = [torch.from_numpy(rng.integers(0, Q_IN + 1, (1, self.c_in, SH // (s // 2), SW // (s // 2)))).float() for s in LEVELS]
-            self.dtype = torch.float64
-            ref = [self.run(x) for x in xs]
-            self.dtype = torch.float32
-            ok = all(torch.equal(r, self.run(x)) for r, x in zip(ref, xs))
-        else:
-            self.dtype = torch.float64
-            ref = self(x_q)
-            self.dtype = torch.float32
-            ok = np.array_equal(ref, self(x_q))
+    def self_check(self) -> bool:
+        """이 기계의 float32 합성곱이 정확한지 레벨별 격자 크기마다 float64 결과와 비교. 아니면 float64 합성곱으로 전환.
+        (합성곱 구현이 격자 크기마다 달라질 수 있어서 모든 크기를 본다)"""
+        rng = np.random.default_rng(0)
+        xs = [torch.from_numpy(rng.integers(0, Q_IN + 1, (1, C_IN, SH // h, SW // h))).float() for h in HS]
+        self.dtype = torch.float64
+        ref = [self.run(x) for x in xs]
+        self.dtype = torch.float32
+        ok = all(torch.equal(r, self.run(x)) for r, x in zip(ref, xs))
         if not ok:
             self.dtype = torch.float64
         return ok
 
-    def __call__(self, x_q: np.ndarray) -> np.ndarray:
-        x = torch.from_numpy(x_q).to(self.dtype)
-        for W, B, M, dil, relu in self._t:
-            acc = F.conv2d(x, W.to(self.dtype), padding=dil * (W.shape[-1] // 2), dilation=dil)
-            acc = acc.round().to(torch.int64)  # 정확한 정수
-            y = ((acc + B) * M) >> SHIFT
-            if relu:
-                y = y.clamp(0, 255)
-            x = y.to(self.dtype)
-        return x.to(torch.int64).numpy()
-
     def run(self, x: torch.Tensor) -> torch.Tensor:
-        """x: float32 정수값 텐서 → 정수값 logits (float32 텐서). f32 가 아니면 __call__ 과 결과가 같다."""
-        if self.f32:
-            x = x.to(self.dtype).contiguous(memory_format=torch.channels_last)
-            for W, B, Ms, dil, relu in self._g:
-                y = F.conv2d(x, W.to(self.dtype), padding=dil * (W.shape[-1] // 2), dilation=dil).float()  # 정확한 정수
-                y.add_(B).mul_(Ms).floor_()
-                if relu:
-                    y.clamp_(0, 255)
-                x = y.to(self.dtype)
-            return x.float().contiguous()
-        x = x.to(self.dtype)
-        for W, B, Ms, dil, relu in self._f:
-            y = F.conv2d(x, W.to(self.dtype), padding=dil * (W.shape[-1] // 2), dilation=dil).double().add_(B).mul_(Ms).floor_()
+        """x: (n,23,gh,gw) 정수값 float 텐서 → (n,5,gh,gw) 정수값 logit (float32)."""
+        x = x.to(self.dtype).contiguous(memory_format=torch.channels_last)
+        for W, B, Ms, dil, relu in self._g:
+            y = F.conv2d(x, W.to(self.dtype), padding=dil * (W.shape[-1] // 2), dilation=dil).float()  # 정확한 정수
+            y.add_(B).mul_(Ms).floor_()
             if relu:
                 y.clamp_(0, 255)
             x = y.to(self.dtype)
-        return x
+        return x.float().contiguous()
 
-    # 직렬화: 층 수, 각 층 (o,i,k,pad,relu) + W(int8) + B(int32) + M(int32)
+    # 직렬화: [u8 층 수] + 층마다 [u16 o][u16 i][u8 k][u8 dil][u8 relu|FLAGS] + W int8 + B int32 + M int32
     def to_bytes(self) -> bytes:
         out = [struct.pack("<B", len(self.layers))]
         for li, (W, B, M, dil, relu) in enumerate(self.layers):
             o, i, k, _ = W.shape
-            flags = ((2 if self.f32 else 0) | (4 if self.wide else 0)) if li == 0 else 0
-            out.append(struct.pack("<HHBBB", o, i, k, dil, int(relu) | flags))
-            out.append(W.astype(np.int8).tobytes())
-            out.append(B.astype(np.int32).tobytes())
-            out.append(M.astype(np.int32).tobytes())
+            out.append(struct.pack("<HHBBB", o, i, k, dil, int(relu) | (FLAGS if li == 0 else 0)))
+            out += [W.astype(np.int8).tobytes(), B.astype(np.int32).tobytes(), M.astype(np.int32).tobytes()]
         return b"".join(out)
 
     @classmethod
     def from_bytes(cls, buf: bytes, off: int = 0):
         (n,) = struct.unpack_from("<B", buf, off)
         off += 1
-        layers, f32, wide = [], False, False
+        layers = []
         for li in range(n):
             o, i, k, dil, relu = struct.unpack_from("<HHBBB", buf, off)
-            if li == 0:
-                f32, wide, relu = bool(relu & 2), bool(relu & 4), relu & 1
-            dil = max(dil, 1)  # 예전 형식은 1x1 층에 0 (padding) 을 적었다
             off += 7
+            if li == 0:
+                assert relu & FLAGS == FLAGS, "예전 형식 (float64 재양자화 / 최대 빈도 2^15) 은 지원하지 않는다"
+                relu &= 1
             W = np.frombuffer(buf, np.int8, o * i * k * k, off).reshape(o, i, k, k).astype(np.int64)
             off += o * i * k * k
             B = np.frombuffer(buf, np.int32, o, off).astype(np.int64)
@@ -273,78 +173,29 @@ class QNet:
             M = np.frombuffer(buf, np.int32, o, off).astype(np.int64)
             off += 4 * o
             layers.append((W, B, M, dil, bool(relu)))
-        return cls(layers, f32, wide), off
+        return cls(layers), off
 
 
-def quantize_ctxnet(state_dict: dict, calib_inputs: list[np.ndarray], wbits: int = 8, dils=None, wq: dict | None = None,
-                    f32: bool = False, wide: bool = False) -> QNet:
-    """float CtxNet (Conv-ReLU 반복 + 마지막 1x1) → QNet. calib_inputs: build_input_q 결과 몇 개.
-
-    wq: 층 이름 → (정수 가중치, 출력 채널별 스케일). 주면 그 양자화를 그대로 쓴다 (self-compression 학습 결과).
-    """
-    convs = [(k[: -len(".weight")], v) for k, v in state_dict.items() if k.endswith(".weight")]
-    x_float = [torch.from_numpy(x.astype(np.float32)) / Q_IN for x in calib_inputs]  # float 모델 입력 (0..1)
-    s_in = 1.0 / Q_IN  # 정수 입력 1 단위의 실수값
-    layers = []
-    qmax = 2 ** (wbits - 1) - 1
-    for li, (name, Wf) in enumerate(convs):
-        bf = state_dict[name + ".bias"]
-        last = li == len(convs) - 1
-        dil = 1 if (dils is None or li >= len(dils)) else dils[li]
-        pad = dil * (Wf.shape[-1] // 2)
-        if wq is not None and name in wq:
-            W_q, s_w = (torch.as_tensor(v).float() for v in wq[name])
-            Wf = W_q * s_w.view(-1, 1, 1, 1)  # 활성 범위도 학습한 (양자화된) 가중치로 잰다
-        else:
-            s_w = Wf.abs().amax((1, 2, 3)).clamp_min(1e-8) / qmax  # 출력 채널별
-            W_q = (Wf / s_w.view(-1, 1, 1, 1)).round().clamp(-qmax, qmax)
-        # float 모델로 다음 활성값 범위 측정
-        ys = [F.conv2d(x, Wf, bf, padding=pad, dilation=dil) for x in x_float]
-        if last:
-            s_out = 1.0 / LOGIT_UNIT
-        else:
-            ys = [y.relu() for y in ys]
-            hi = torch.quantile(torch.cat([y.flatten()[:: max(1, y.numel() // 200000)] for y in ys]), 0.9999).item()
-            s_out = max(hi, 1e-3) / 255
-        # 정수 경로: y_q = (acc + B) * M >> S,  acc 단위 = s_in * s_w
-        unit = s_in * s_w
-        B_q = (bf / unit).round()
-        M = (unit / s_out * 2**SHIFT).round()
-        layers.append((W_q.numpy().astype(np.int64), B_q.numpy().astype(np.int64), M.numpy().astype(np.int64), dil, not last))
-        x_float = [y for y in ys] if not last else x_float
-        s_in = s_out
-    return QNet(layers, f32, wide)
-
-
-def probs_from_logits(logit_q: np.ndarray, table: np.ndarray = EXP_TABLE) -> np.ndarray:
-    """(n,5) 정수 logit → (n,5) float64 확률 (정수 빈도의 정확한 나눗셈)."""
-    logit_q = np.ascontiguousarray(logit_q)
-    d = np.minimum(logit_q.max(1, keepdims=True) - logit_q, 255)
-    f = table[d].astype(np.float64)
-    # constriction 은 stride 를 무시하고 메모리를 그대로 읽는다 → 반드시 C 연속 배열로 넘긴다
-    return np.ascontiguousarray(f / f.sum(1, keepdims=True))
-
-
-_EXP_T = torch.from_numpy(EXP_TABLE.astype(np.float64))
-_EXP_T_WIDE = torch.from_numpy(EXP_TABLE_WIDE.astype(np.float64))
-
-
-def probs_from_logits_t(logit: torch.Tensor, table: torch.Tensor = _EXP_T) -> np.ndarray:
-    """probs_from_logits 와 같은 값 (torch, 멀티스레드). logit: (n,5) 정수값 텐서."""
+def probs(logit: torch.Tensor) -> np.ndarray:
+    """(m,5) 정수값 logit → (m,5) float64 확률: freq_c = FREQ[min(max logit - logit_c, 255)], p_c = freq_c / Σ freq.
+    (빈도가 정수라 합과 나눗셈이 정확 → 기계와 무관. constriction 은 stride 를 무시하므로 C 연속 배열로 넘긴다)"""
     d = (logit.amax(1, keepdim=True) - logit).clamp_(max=255).long()
-    f = table[d]
+    f = FREQ[d]
     return (f / f.sum(1, keepdim=True)).contiguous().numpy()
 
 
-# ---------------------------------------------------------------- coarse 격자 (적응형 카운트)
+# ---------------------------------------------------------------- stride-32 격자 (적응형 카운트)
 def coarse_pos():
+    """stride-32 격자 칸의 (행, 열) 픽셀 좌표, 행 우선 192개."""
     ys, xs = np.mgrid[0:SH:LEVELS[0], 0:SW:LEVELS[0]]
     return ys.ravel(), xs.ravel()
 
 
 class CoarseModel:
+    """문맥 (이전 맵의 같은 칸 클래스, 5 = 이전 맵 없음) 마다 클래스 카운트. 처음 1, 프레임을 보낼 때마다 +16."""
+
     def __init__(self):
-        self.c = np.ones((K + 1, K), np.int64)  # 문맥 = 이전 프레임 같은 칸 (5 = 없음)
+        self.c = np.ones((K + 1, K), np.int64)
 
     def probs(self, ctx):
         c = self.c[ctx].astype(np.float64)
@@ -362,82 +213,69 @@ def _family():
 
 
 def encode(seg: np.ndarray, qnet: QNet, chunk: int = 16) -> bytes:
-    """디코드 순서대로 프레임 chunk 개씩 묶어 확률을 한 번에 계산한 뒤, 그 순서(프레임 → 패스) 대로 부호화한다."""
+    """seg (n,SH,SW) uint8 → [u32 n] + range coder 단어 (u32).
+    확률은 chunk 장씩 묶어 한 번에 계산하고 (인코더는 모든 맵을 안다), 부호화는 디코드 순서 (프레임 → 격자 → 레벨 → 패스) 대로."""
     import constriction
 
     n = len(seg)
-    bidir = qnet.c_in in BIDIR
-    order = coding_order(n, bidir)
     enc = constriction.stream.queue.RangeEncoder()
     fam = _family()
     cm = CoarseModel()
     cy, cx = coarse_pos()
-    fi = FastInput(qnet.c_in)
+    fi = Inputs()
     seg_t = torch.from_numpy(seg)
-    for i0 in range(0, n, chunk):
-        frames = order[i0 : i0 + chunk]
-        ctx = [ctx_index(t, n, bidir) for t in frames]
-        cur = seg_t[frames]
-        fp, fp2 = fi.ctx_fracs(seg_t, [c[0] for c in ctx]), fi.ctx_fracs(seg_t, [c[1] for c in ctx])
-        bf = torch.tensor([bidir and t % 2 == 1 for t in frames])
-        per_pass = []
+    for t0 in range(0, n, chunk):
+        frames = list(range(t0, min(t0 + chunk, n)))
+        cur = seg_t[frames[0] : frames[-1] + 1]
+        fp = fi.ctx_fracs(seg_t, [t - 1 if t >= 1 else None for t in frames])
+        fp2 = fi.ctx_fracs(seg_t, [t - 2 if t >= 2 else None for t in frames])
+        per_pass = []  # [(logit (b,m,5), 기호 (b,m))]
         with torch.inference_mode():
             for s in LEVELS:
                 h = s // 2
-                for kind in qnet.passes:
-                    _, tg = fi.known[h, kind]
-                    logit = qnet.run(fi.build(cur, s, kind, fp, fp2, bf))  # (b,5,gh,gw)
-                    lt = logit[:, :, tg].permute(0, 2, 1).to(torch.int64).numpy()  # (b,nt,5)
-                    sy = cur[:, ::h, ::h][:, tg].numpy().astype(np.int32)  # (b,nt)
-                    per_pass.append((lt, sy))
+                for kind in PASSES:
+                    tg = fi.target[h, kind]
+                    logit = qnet.run(fi.build(cur, s, kind, fp, fp2))
+                    per_pass.append((logit[:, :, tg].permute(0, 2, 1), cur[:, ::h, ::h][:, tg].numpy().astype(np.int32)))
         for j, t in enumerate(frames):
             sym = seg[t, cy, cx].astype(np.int32)
-            c0 = ctx[j][0]
-            cctx = seg[c0, cy, cx].astype(np.int64) if c0 is not None else np.full(len(cy), K)
+            cctx = seg[t - 1, cy, cx].astype(np.int64) if t >= 1 else np.full(len(cy), K)
             enc.encode(sym, fam, cm.probs(cctx))
             cm.update(cctx, sym)
             for lt, sy in per_pass:
-                enc.encode(np.ascontiguousarray(sy[j]), fam, probs_from_logits(lt[j], EXP_TABLE_WIDE if qnet.wide else EXP_TABLE))
-    words = enc.get_compressed()
-    return struct.pack("<I", n) + words.tobytes()
+                enc.encode(np.ascontiguousarray(sy[j]), fam, probs(lt[j]))
+    return struct.pack("<I", n) + enc.get_compressed().tobytes()
 
 
-def decode(buf: bytes, qnet: QNet, progress=None) -> np.ndarray:
+def decode(buf: bytes, qnet: QNet) -> np.ndarray:
+    """encode 의 역. → (n,SH,SW) uint8"""
     import constriction
 
     (n,) = struct.unpack_from("<I", buf, 0)
-    words = np.frombuffer(buf, np.uint32, offset=4)
-    dec = constriction.stream.queue.RangeDecoder(words)
+    dec = constriction.stream.queue.RangeDecoder(np.frombuffer(buf, np.uint32, offset=4))
     fam = _family()
     cm = CoarseModel()
     cy, cx = coarse_pos()
-    fi = FastInput(qnet.c_in)
-    bidir = qnet.c_in in BIDIR
+    fi = Inputs()
     seg = np.zeros((n, SH, SW), np.uint8)
-    seg_t = torch.from_numpy(seg)  # 메모리 공유
-    zero = fi.fracs(None, 1)
-    cache = {}  # 디코드한 프레임의 비율 (문맥으로 다시 쓰인다)
+    seg_t = torch.from_numpy(seg)  # 같은 메모리
+    zero = fi.fracs(None)
+    fr = {}  # 복호화한 맵의 클래스 비율 (다음 두 프레임의 문맥)
     with torch.inference_mode():
-        for done, t in enumerate(coding_order(n, bidir)):
+        for t in range(n):
             cur = seg_t[t : t + 1]
-            c0, c1 = ctx_index(t, n, bidir)
-            fp, fp2 = cache.get(c0, zero), cache.get(c1, zero)
-            bf = torch.tensor([bidir and t % 2 == 1])
-            cctx = seg[c0, cy, cx].astype(np.int64) if c0 is not None else np.full(len(cy), K)
+            fp, fp2 = fr.get(t - 1, zero), fr.get(t - 2, zero)
+            cctx = seg[t - 1, cy, cx].astype(np.int64) if t >= 1 else np.full(len(cy), K)
             sym = dec.decode(fam, cm.probs(cctx))
             seg[t, cy, cx] = sym
             cm.update(cctx, sym.astype(np.int64))
             for s in LEVELS:
                 h = s // 2
-                for kind in qnet.passes:
-                    _, tg = fi.known[h, kind]
-                    logit = qnet.run(fi.build(cur, s, kind, fp, fp2, bf))[0]  # (5,gh,gw)
-                    p = probs_from_logits_t(logit[:, tg].T, _EXP_T_WIDE if qnet.wide else _EXP_T)
-                    g = cur[0, ::h, ::h]  # view
-                    g[tg] = torch.from_numpy(dec.decode(fam, p).astype(np.uint8))
-            cache[t] = fi.fracs(cur, 1)
-            for k in [k for k in cache if k < t - 4]:
-                del cache[k]
-            if progress:
-                progress(done)
+                g = cur[0, ::h, ::h]  # view: 복호화한 값이 바로 seg 에 들어간다
+                for kind in PASSES:
+                    tg = fi.target[h, kind]
+                    logit = qnet.run(fi.build(cur, s, kind, fp, fp2))[0]  # (5,gh,gw)
+                    g[tg] = torch.from_numpy(dec.decode(fam, probs(logit[:, tg].T)).astype(np.uint8))
+            fr[t] = fi.fracs(cur)
+            fr.pop(t - 2, None)
     return seg

@@ -35,10 +35,10 @@ bash comma_vcc/run.sh my_idea --recompress   # compress.sh 를 다시 돌림
 
 ## 우리 접근: semantic_cpu (CPU 만으로)
 
-영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.26, 점수 0.1196)
+영상을 복원하지 않는다. 평가 네트워크 두 개가 원본과 같은 출력을 내는 프레임을 만든다. (현재 v6.26, 점수 0.1196, 다시 짜기 가이드: [GUIDE.md](GUIDE.md))
 
 ```
-archive (161KB) = 정수 문맥 CNN (13KB, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (120KB) + 렌더러 (17KB, 폭 24·32·40, 채널별 학습 비트, 215/251 채널) + pose (11KB, 회색 기저 8개 5비트, 계수 8비트 Rice 부호)
+archive (148KB) = 정수 문맥 CNN (14KB, 6층 dilation 1,2,4,8,2,1, 채널별 학습 비트) + seg 맵 601장 무손실 스트림 (106KB) + 렌더러 (16KB, 폭 24·32·40, 채널별 학습 비트, 213/251 채널) + pose (11KB, 회색 기저 8개 5비트, 계수 8비트 Rice 부호)
                (문맥 모델·렌더러 정수 가중치는 채널별 이산 라플라스 range coder, wcodec.py)
 
 seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본 짝수 프레임 0 의 맵 1장)
@@ -49,19 +49,29 @@ seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본
 ```
 
 ### 파일
+다시 짜기 위한 형식 명세·단계별 검증·학습 레시피·제출 체크리스트는 [GUIDE.md](GUIDE.md).
+
 | 경로 | 내용 |
 | --- | --- |
+| `submissions/semantic_cpu/inflate.py`, `inflate.sh` | 디코더 진입점 |
 | `submissions/semantic_cpu/segcodec.py` | 계층 순서 + 정수 문맥 CNN + range coder (인코드/디코드) |
-| `submissions/semantic_cpu/model.py` | 렌더러, 아핀/carrier, 가중치 저장 형식, 서브픽셀 확장 |
-| `submissions/semantic_cpu/archive.py`, `inflate.py`, `inflate.sh` | archive 포맷과 복원 |
+| `submissions/semantic_cpu/wcodec.py` | 정수 가중치 엔트로피 부호 |
+| `submissions/semantic_cpu/model.py` | 렌더러, 가중치 형식, 아핀 + 기저 합성, 서브픽셀 확장 |
+| `submissions/semantic_cpu/archive.py` | archive 컨테이너, 렌더러/pose 섹션 |
 | `lab/build_cache.py` | 원본을 한 번 디코드해서 네트워크 입출력 캐시 |
 | `lab/ctxmodel.py` | 문맥 CNN 학습 (float) |
-| `lab/renderer.py` | 렌더러 학습 |
-| `lab/pose_fit.py`, `lab/pose_refine.py` | pose 피팅 (기저+계수), 쌍별 다듬기 |
+| `lab/renderer.py`, `lab/selfcomp.py` | 렌더러 학습, self-compression |
+| `lab/pose_fit.py`, `lab/pose_refine.py`, `lab/posefmt.py` | pose 피팅 (기저+계수), 쌍별 다듬기, 중간 파일 형식 |
 | `lab/build_archive.py` | 정수화 + 인코드 + archive.zip 조립 |
-| 나머지 `lab/*_exp.py`, `analyze.py`, `seg_errors.py`, `bits_breakdown.py` | 실험/분석 |
+| `lab/golden.py`, `lab/test_codec.py` | 단계별 기준값 (다시 짠 디코더 확인용), 형식 단위 테스트 |
+
+실험·분석 스크립트 (`carrier_*`, `analyze.py`, `seg_errors.py`, `bits_breakdown.py`, `vjp_*`, `swa_renderer.py` 등) 는
+정리하면서 지웠다. 커밋 `4c31838` 에 있다 (`git show 4c31838:comma_vcc/lab/analyze.py`).
 
 ### v6 재현 (CPU 4코어 + Colab T4, 대략 35시간)
+실제로 돌린 순서 그대로의 기록이다. 정리 전 옵션 이름이라 지금 코드에서는 일부가 다르다
+(`--split-a` 없어짐 = 항상 23채널, `--ctx-f32 --wide-probs --wec` 는 build_archive 기본 동작, `--round`·`--film`·`--carrier` 삭제).
+지금 코드로 처음부터 하는 순서는 GUIDE.md 6절.
 ```bash
 cd comma_vcc/lab
 ../.venv/bin/python build_cache.py                                                   # 3분
@@ -220,7 +230,7 @@ CPU 로는 렌더러 flip 학습 1에폭이 약 8분이라, 같은 레시피를 
 공식 러너는 GitHub `ubuntu-latest` (4 vCPU) 이고 30분에는 환경 준비(apt, uv sync, LFS)도 포함된다.
 러너가 2~3배 느리면 빠듯할 수 있다 — 실제 제출 전에는 러너에서 시간을 확인해야 한다.
 
-### 분석에서 나온 사실 (lab/analyze.py 등)
+### 분석에서 나온 사실 (커밋 4c31838 의 lab/analyze.py 등)
 - 평가 네트워크는 1164x874 를 512x384 로 bilinear 축소해서 본다. 축소가 읽는 원본 픽셀은 768행 x 1024열뿐이고 겹치지 않는다.
   → 512x384 이미지만 설계하면 되고, **각 칸의 2x2 원본 픽셀을 서로 다른 정수로 채우면 정수 사이 값까지 표현된다** (model.expand_fine).
   정수 반올림 대비 축소 오차 0.22 → 0.0035, GT 를 넣었을 때 pose 항 0.034 → 0.0013.

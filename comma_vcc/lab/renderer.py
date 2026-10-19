@@ -1,8 +1,11 @@
-"""seg 맵 → 홀수 프레임(512x384 RGB) 렌더러.
+"""seg 맵 → 홀수 프레임(512x384 RGB) 렌더러 학습.
 
-SegNet(render(M)) 의 argmax 가 M 과 같아지도록 학습한다. 렌더러 가중치는 archive 에 들어가므로 작게 유지한다.
+SegNet(render(M)) 의 argmax 가 M 과 같아지도록 학습한다. 렌더러 가중치는 archive 에 들어가므로 작게 유지한다
+(--qat: 고정 비트 가짜 양자화, --self-compress: 채널별 비트·스케일 학습 = selfcomp.py).
 
-    python renderer.py --epochs 20 --out ../cache/renderer.pt
+    python renderer.py --widths 24,32,40 --epochs 20 --out ../cache/renderer.pt
+결과: --out (inflate 와 같은 float 가중치), self-compression 이면 --out.q (archive 에 넣을 pack_state 바이트) 와
+      --out.sc.pt (이어서 학습용 float 가중치 + 비트/스케일) 도 쓴다.
 """
 
 from __future__ import annotations
@@ -17,17 +20,12 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from common import CACHE, SH, SW, load_gt, nets, setup_device
+from common import CACHE, SH, SW, load_gt, nets, parse_widths, quantize_roundtrip, setup_device
 import copy
 
-from model import Renderer, fake_quant_, make_renderer, quantize_roundtrip, render, widen_renderer  # noqa: E402  (제출물 패키지와 같은 정의)
+from model import Renderer  # noqa: E402  (제출물 패키지와 같은 정의)
 
 PALETTE = np.array([[64, 64, 64], [230, 230, 230], [42, 120, 214], [12, 163, 12], [208, 59, 59]], np.uint8)
-
-
-def quantize_ste(x: torch.Tensor) -> torch.Tensor:
-    """반올림 (gradient 는 그대로 통과). 실제 프레임은 uint8 이라 학습 때부터 반올림을 넣는다."""
-    return x + (x.round() - x).detach()
 
 
 def png(arr: np.ndarray) -> bytes:
@@ -50,8 +48,40 @@ def ste_params(G, bits):
     return out
 
 
+def widen_renderer(old: Renderer, c1: int, c2: int, c3: int) -> Renderer:
+    """렌더러를 더 넓게 만들되 처음엔 같은 함수가 되도록 (새 채널의 나가는 가중치 = 0).
+
+    새 채널은 기본 초기화된 들어오는 가중치를 가지므로 학습이 시작되면 바로 쓰이기 시작한다.
+    """
+    o1, o2, o3 = old.cfg
+    new = Renderer(c1, c2, c3)
+    r = lambda a, b: list(range(a, b))  # noqa: E731
+    # 층별 (이전 입력 인덱스 → 새 입력 인덱스)
+    in_maps = {
+        "e1.0": (r(0, 7), r(0, 7)),
+        "e1.2": (r(0, o1), r(0, o1)),
+        "e2.0": (r(0, o1), r(0, o1)),
+        "e2.2": (r(0, o2), r(0, o2)),
+        "e3.0": (r(0, o2), r(0, o2)),
+        "e3.2": (r(0, o3), r(0, o3)),
+        "d2.0": (r(0, o3 + o2), r(0, o3) + r(c3, c3 + o2)),
+        "d1.0": (r(0, o2 + o1), r(0, o2) + r(c2, c2 + o1)),
+        "out": (r(0, o1), r(0, o1)),
+    }
+    olds, news = dict(old.named_modules()), dict(new.named_modules())
+    with torch.no_grad():
+        for name, (src_in, dst_in) in in_maps.items():
+            a, b = olds[name], news[name]
+            n_out = a.weight.shape[0]
+            new_cols = sorted(set(range(b.weight.shape[1])) - set(dst_in))
+            b.weight[:n_out, new_cols] = 0  # 기존 출력은 새 입력을 보지 않는다
+            b.weight[:n_out][:, dst_in] = a.weight[:, src_in]
+            b.bias[:n_out] = a.bias
+    return new
+
+
 @torch.inference_mode()
-def evaluate(G, net, seg, idx, bs=8, rounded=False, bits=8, sd=None):
+def evaluate(G, net, seg, idx, bs=8, bits=8, sd=None):
     """inflate 와 같은 조건: 저장/복원 왕복 가중치, float 출력 (서브픽셀 확장으로 거의 그대로 전달된다).
 
     sd 를 주면 그 (이미 양자화된) 가중치를 그대로 쓴다 (self-compression 의 export).
@@ -65,8 +95,7 @@ def evaluate(G, net, seg, idx, bs=8, rounded=False, bits=8, sd=None):
     errs = []
     for i in range(0, len(idx), bs):
         m = torch.from_numpy(seg[idx[i : i + bs]]).to(dev)
-        img = render(Gq, m, torch.from_numpy(np.asarray(idx[i : i + bs])))
-        out = net.segnet(img.round() if rounded else img).argmax(1)
+        out = net.segnet(Gq(m)).argmax(1)
         errs.append((out != m).float().mean((1, 2)).cpu())
     return torch.cat(errs)
 
@@ -90,17 +119,11 @@ def main():
     ap.add_argument("--out", default=str(CACHE / "renderer.pt"))
     ap.add_argument("--resume", default=None)
     ap.add_argument("--port", type=int, default=None)
-    ap.add_argument("--round", action="store_true", help="학습 때 출력 반올림 (정수 프레임용, 서브픽셀 확장을 쓰면 불필요)")
     ap.add_argument("--fp32", action="store_true", help="SegNet 을 bf16 대신 fp32 로 (느리지만 평가와 같은 수치)")
     ap.add_argument("--cosine", action="store_true", help="OneCycle 대신 cosine 감쇠 (이어서 학습할 때)")
-    ap.add_argument("--arch", default="v1", help="v1 | v2 (전해상도 + 프레임별 FiLM)")
-    ap.add_argument("--width", type=int, default=48)
-    ap.add_argument("--fdim", type=int, default=8)
-    ap.add_argument("--widths", default=None, help="v1 폭 c1,c2,c3 (예: 24,32,40)")
-    ap.add_argument("--film", type=int, default=0, help="> 0 이면 v1 에 프레임별 FiLM (이 차원의 프레임 코드). --resume 이 FiLM 없는 체크포인트면 FiLM 0 에서 시작")
-    ap.add_argument("--widen-from", default=None, help="이 v1 체크포인트를 --widths 로 넓혀서 시작 (처음엔 같은 출력)")
-    ap.add_argument("--bits", type=int, default=8, help="저장 비트 수 (평가에 반영)")
-    ap.add_argument("--project", action="store_true", help="스텝마다 가중치를 --bits 격자로 투영 (양자화 인지 미세조정)")
+    ap.add_argument("--widths", default=None, help="폭 c1,c2,c3 (예: 24,32,40, 기본 16,24,32)")
+    ap.add_argument("--widen-from", default=None, help="이 체크포인트를 --widths 로 넓혀서 시작 (처음엔 같은 출력)")
+    ap.add_argument("--bits", type=int, default=8, help="저장 비트 수 (평가에 반영). self-compression 이면 시작 비트")
     ap.add_argument("--qat", action="store_true", help="STE 가짜 양자화로 학습 (--bits 격자, float 원본 가중치 유지)")
     ap.add_argument("--full-eval", action="store_true", help="끝나고 600장 전체 평가")
     ap.add_argument("--start-epoch", type=int, default=0, help="--resume 와 함께: 이 에폭부터 (학습률 일정을 그만큼 진행시킨다, 컨테이너 재시작 대비)")
@@ -117,10 +140,8 @@ def main():
     _, seg, _ = load_gt()
     if args.limit:
         seg = seg[: args.limit]
-    widths = tuple(int(v) for v in args.widths.split(",")) if args.widths else None
-    if args.film:
-        widths = (widths or (16, 24, 32)) + (args.film, len(seg))
-    G = make_renderer((args.width, args.fdim, len(seg), (1, 1, 2, 4)) if args.arch == "v2" else widths)
+    widths = parse_widths(args.widths)
+    G = Renderer(*widths)
     if args.widen_from:
         sd_old = torch.load(args.widen_from, map_location="cpu")
         old = Renderer(*(sd_old[f"{k}.0.weight"].shape[0] for k in ("e1", "e2", "e3")))  # 폭은 체크포인트에서 읽는다
@@ -128,10 +149,7 @@ def main():
         G = widen_renderer(old, *widths)
     net.segnet.to(memory_format=torch.channels_last)
     if args.resume:
-        missing, unexpected = G.load_state_dict(torch.load(args.resume, map_location="cpu"), strict=False)
-        assert not unexpected and all(k.startswith(("frame.", "film")) for k in missing), (missing, unexpected)
-        if missing:
-            print(f"체크포인트에 없는 FiLM 파라미터는 초기값(변조 없음)으로 시작: {missing}")
+        G.load_state_dict(torch.load(args.resume, map_location="cpu"))
     G.to(dev)
     print(f"renderer params: {sum(p.numel() for p in G.parameters()):,} ({dev})")
     sc = None
@@ -172,13 +190,11 @@ def main():
         for b in range(0, len(perm) - args.bs + 1, args.bs):
             m = torch.from_numpy(seg[perm[b : b + args.bs]]).long().to(dev)
             if sc is not None:
-                img = torch.func.functional_call(G, sc.params(G), (m, torch.from_numpy(perm[b : b + args.bs])))
+                img = torch.func.functional_call(G, sc.params(G), (m,))
             elif args.qat:
-                img = torch.func.functional_call(G, ste_params(G, args.bits), (m, torch.from_numpy(perm[b : b + args.bs])))
+                img = torch.func.functional_call(G, ste_params(G, args.bits), (m,))
             else:
-                img = render(G, m, torch.from_numpy(perm[b : b + args.bs]))
-            if args.round:
-                img = quantize_ste(img)
+                img = G(m)
             with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=not args.fp32):
                 logits = net.segnet(img)
             logits = logits.float()
@@ -201,8 +217,6 @@ def main():
             opt.zero_grad()
             loss.backward()
             opt.step()
-            if args.project:
-                fake_quant_(G, args.bits)
             sched.step()
             step += 1
             with torch.no_grad():
@@ -214,20 +228,18 @@ def main():
         if sc is not None:
             sd_exp, packed = sc.export(G)
             import archive
-
             import wcodec
 
-            nbytes = len(archive.pack_renderer(G.cfg, packed))
-            nbytes_ec = len(archive.pack_renderer(G.cfg, wcodec.ec_pack(packed, G.state_dict())))
+            nbytes = len(archive.pack_renderer(G.cfg, wcodec.ec_pack(packed, G.state_dict())))
             with torch.no_grad():
                 est = sc.rate_bits(G).item() / 8
-            viz.log(step, renderer_bytes=nbytes, renderer_bytes_ec=nbytes_ec, bits_per_weight=sc.bits_per_weight().item())
-            print(f"   self-compression: 렌더러 {nbytes:,} B (엔트로피 부호 {nbytes_ec:,} B, 추정 {est:,.0f} B), {sc.summary()}", flush=True)
+            viz.log(step, renderer_bytes=nbytes, bits_per_weight=sc.bits_per_weight().item())
+            print(f"   self-compression: 렌더러 {nbytes:,} B (추정 {est:,.0f} B), {sc.summary()}", flush=True)
         errs = evaluate(G, net, seg, val_idx, bits=args.bits, bs=16 if dev.type == "cuda" else 8, sd=sd_exp)
         viz.log(step, val_disagreement_fp32=errs.mean().item(), val_seg_term=100 * errs.mean().item())
         with torch.inference_mode():
             m = torch.from_numpy(seg[val_idx[:1]]).to(dev)
-            img = render(G, m, torch.from_numpy(val_idx[:1]))
+            img = G(m)
             out = net.segnet(img).argmax(1)
             img, out, m = img.cpu(), out.cpu(), m.cpu()
         vis = np.concatenate([img[0].round().clamp(0, 255).permute(1, 2, 0).byte().numpy(), PALETTE[out[0].numpy()]], 1)

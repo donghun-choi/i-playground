@@ -1,11 +1,12 @@
-"""양자화 가중치(정수) 엔트로피 부호: 출력 채널마다 이산 라플라스(기하) 분포 하나, 파라미터 1바이트.
+"""정수 가중치 엔트로피 부호: 행 (출력 채널) 마다 이산 라플라스 분포 하나, 파라미터 r 은 1바이트.
 
 P(q) ∝ f(|q|),  f(0) = 2^24,  f(k+1) = max(1, f(k)·r >> 8),  r = 1..255,  q ∈ [-qmax, qmax]
 빈도를 정수 연산만으로 만들고 정확한 나눗셈으로 확률을 내므로 (segcodec 과 같은 방식) 기계와 무관하게 같은 부호가 된다.
 
-pack_state 형식 (model.py) 의 바이트를 그대로 받아 같은 바이트로 되돌린다:
-    ec_pack(buf, template) → 'EC' 형식,  ec_unpack(buf, template) → pack_state 형식
-EC 형식: "<HB" (n, 0xEC) + u32 len + xz(스케일·1차원 fp16·채널별 r·텐서별 qmax) + range coder 단어들
+  ec_pack(buf, template)  ↔ ec_unpack:  렌더러 pack_state 바이트 (model.py) 를 그대로 되돌린다
+  ec_pack_qnet(buf)       ↔ ec_unpack_qnet:  QNet.to_bytes 바이트 (segcodec.py)
+  ec_pack_rows(q)         ↔ ec_unpack_rows:  정수 행렬 하나 (pose 기저)
+바이트 단위 명세는 comma_vcc/GUIDE.md
 """
 
 from __future__ import annotations
@@ -85,6 +86,8 @@ def _parse(buf: bytes, template: dict):
 
 
 def ec_pack(buf: bytes, template: dict) -> bytes:
+    """pack_state 바이트 → "<HBI" (텐서 수, 0xEC, xz 길이) + xz([u8 비트] + 텐서마다 [u8 종류] + (1차원: fp16 값 |
+    2차원 이상: [u8 qmax] + fp16 스케일 + 행별 r 바이트)) + range coder 단어 (2차원 이상 텐서의 정수, 텐서·행 순서)."""
     import constriction
 
     n, bits, items = _parse(buf, template)
@@ -99,10 +102,6 @@ def ec_pack(buf: bytes, template: dict) -> bytes:
         raw += [struct.pack("<B", qmax), sc, rs]
     z = lzma.compress(b"".join(raw), format=lzma.FORMAT_RAW, filters=_FILTERS)
     return struct.pack("<HBI", n, MARK, len(z)) + z + enc.get_compressed().tobytes()
-
-
-def is_ec(buf: bytes) -> bool:
-    return len(buf) >= 3 and buf[2] == MARK
 
 
 def ec_unpack(buf: bytes, template: dict) -> bytes:

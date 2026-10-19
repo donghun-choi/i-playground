@@ -1,10 +1,11 @@
-"""pose v2 피팅 (600쌍): 짝수 = 아핀_i(이전 쌍 렌더) + bicubic(Σ c[i,k] B_k)
+"""pose 처음 피팅 (600쌍): 짝수 = 아핀_i(이전 쌍 렌더) + bicubic(Σ c[i,k] B_k). 결과는 pose2 blob (posefmt.py).
 
-첫 쌍의 '이전 프레임' 은 GT 짝수 프레임 0 의 SegNet 맵을 렌더한 것 (seg 스트림 맨 앞에 한 장 더 보낸다).
-  1) bf16 (차원 가중) → 2) fp32 (차원 가중 → 일반 MSE) → 3) B int8 고정, c/a 격자 양자화 + STE 미세조정
+첫 쌍의 '이전 프레임' 은 GT 짝수 프레임 0 의 SegNet 맵을 렌더한 것 (seg 스트림 맨 앞에 한 장 더 보낸다, cache/seg_pre.npy: build_cache.py 와 여기서 같은 값으로 만든다).
+  1) bf16 (차원 가중) → 2) fp32 (차원 가중 → 일반 MSE) → 3) B 고정 (--bbits), c/a 격자 양자화 + STE 미세조정
   4) 쌍별 격자 ±1 탐욕 탐색 → 5) 평가 경로(서브픽셀 확장)로 확인
+이후 다듬기는 pose_refine.py.
 
-    python pose_fit.py --renderer ../cache/renderer_v2w48.pt --renderer-cfg 48,8 --out ../cache/pose2.bin
+    python pose_fit.py --renderer ../cache/renderer.pt --renderer-cfg 24,32,40 --rbits 0 --out ../cache/pose2.bin
 """
 
 from __future__ import annotations
@@ -15,32 +16,27 @@ import time
 import numpy as np
 import torch
 
-from common import CACHE, SH, SW, downsample, load_gt, nets, pose_out
-import archive  # noqa: E402
-from model import parse_rcfg  # noqa: E402
-from model import even_frames_prev, expand_fine, make_renderer, quantize_roundtrip, render  # noqa: E402
+from common import CACHE, SH, SW, downsample, load_gt, load_renderer, nets, parse_widths, pose_out
+from model import even_frames, expand_fine  # noqa: E402
+from posefmt import pack_pose2, unpack_pose2
 
 
-def renders(renderer_path, cfg, seg, pre, bits=8, bs=8, device="cpu"):
-    """inflate 와 같은 홀수 프레임과 '이전 프레임' 들."""
-    G = make_renderer(cfg)
-    G.load_state_dict(torch.load(renderer_path, map_location="cpu"))
-    if bits:  # 0 = 이미 양자화된 가중치 (self-compression export)
-        quantize_roundtrip(G, bits)
-    G.eval().to(device)
+def renders(renderer_path, widths, seg, pre, bits=8, bs=8, device="cpu"):
+    """inflate 와 같은 홀수 프레임과 '이전 프레임' 들. bits = 0: 이미 양자화된 가중치 (self-compression export)."""
+    G = load_renderer(renderer_path, widths, bits, device)
     n = len(seg)
     odd = torch.zeros(n, 3, SH, SW, device=device)
     with torch.inference_mode():
         for i in range(0, n, bs):
-            odd[i : i + bs] = render(G, torch.from_numpy(seg[i : i + bs]).to(device), torch.arange(i, min(i + bs, n)))
-        prev0 = render(G, torch.from_numpy(pre).to(device), torch.zeros(1, dtype=torch.long))
+            odd[i : i + bs] = G(torch.from_numpy(seg[i : i + bs]).to(device))
+        prev0 = G(torch.from_numpy(pre).to(device))
     return odd, torch.cat([prev0, odd[:-1]])
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--renderer", default=str(CACHE / "renderer_v1.pt"))
-    ap.add_argument("--renderer-cfg", default=None, help="렌더러 구성: v1 폭 'c1,c2,c3' 또는 RendererV2 'width,fdim'")
+    ap.add_argument("--renderer-cfg", default=None, help="렌더러 폭 'c1,c2,c3' (기본 16,24,32)")
     ap.add_argument("--out", default=str(CACHE / "pose2.bin"))
     ap.add_argument("--rbits", type=int, default=8, help="렌더러 저장 비트 수 (build_archive 와 같게)")
     ap.add_argument("--k", type=int, default=12)
@@ -67,8 +63,7 @@ def main():
     with torch.inference_mode():
         pre = net.segnet(torch.from_numpy(np.array(small[0:1]))).argmax(1).numpy().astype(np.uint8)
     np.save(CACHE / "seg_pre.npy", pre)
-    cfg = parse_rcfg(args.renderer_cfg, n)
-    odd, prev = renders(args.renderer, cfg, seg, pre, args.rbits)
+    odd, prev = renders(args.renderer, parse_widths(args.renderer_cfg), seg, pre, args.rbits)
     print(f"렌더 {time.time() - t0:.0f}s", flush=True)
     viz = LiveVis(f"comma vcc · pose v2 피팅 (이전 렌더 + 아핀 + carrier k={args.k})", port=args.port).start()
 
@@ -81,7 +76,7 @@ def main():
 
     def evaluate(aa, cc, BB, bs=40):
         with torch.inference_mode():
-            return torch.cat([pose_out(net, even_frames_prev(prev[i : i + bs], aa[i : i + bs], cc[i : i + bs], BB), odd[i : i + bs])
+            return torch.cat([pose_out(net, even_frames(prev[i : i + bs], aa[i : i + bs], cc[i : i + bs], BB), odd[i : i + bs])
                               for i in range(0, n, bs)]) - target
 
     def train(n_steps, bf16, groups, weighted, q=None):
@@ -92,7 +87,7 @@ def main():
             step += 1
             sel = torch.randperm(n)[: args.bs]
             aa, cc = (a[sel], c[sel]) if q is None else q(a[sel], c[sel])
-            e = even_frames_prev(prev[sel], aa, cc, B)
+            e = even_frames(prev[sel], aa, cc, B)
             with torch.autocast("cpu", dtype=torch.bfloat16, enabled=bf16):
                 out = pose_out(net, e, odd[sel])
             sq = (out.float() - target[sel]) ** 2
@@ -148,15 +143,15 @@ def main():
                         d[better] = dn[better]
             print(f"탐욕 탐색 {rnd + 1}: posenet_dist {d.mean():.7f} term {np.sqrt(10 * d.mean()):.4f} ({time.time() - t0:.0f}s)", flush=True)
 
-    blob = archive.pack_pose2(B_q.numpy().astype(np.int8), B_scale.numpy(), c_int.numpy().astype(np.int64), c_step.numpy(),
+    blob = pack_pose2(B_q.numpy().astype(np.int8), B_scale.numpy(), c_int.numpy().astype(np.int64), c_step.numpy(),
                               a_int.numpy().astype(np.int64), a_step.numpy())
     open(args.out, "wb").write(blob)
-    pos = archive.unpack_pose2(blob)
+    pos = unpack_pose2(blob)
     # 평가 경로: float → 서브픽셀 정수 프레임 → 축소 → PoseNet
     dd = []
     with torch.inference_mode():
         for i in range(0, n, 20):
-            e = even_frames_prev(prev[i : i + 20], pos["a"][i : i + 20], pos["c"][i : i + 20], pos["B"])
+            e = even_frames(prev[i : i + 20], pos["a"][i : i + 20], pos["c"][i : i + 20], pos["B"])
             pair = torch.stack([e, odd[i : i + 20]], 1).flatten(0, 1).permute(0, 2, 3, 1).numpy()
             back = downsample(torch.from_numpy(expand_fine(pair))).view(-1, 2, 3, SH, SW)
             dd.append(((pose_out(net, back[:, 0], back[:, 1]) - target[i : i + 20]) ** 2).mean(1))

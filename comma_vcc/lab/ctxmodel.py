@@ -1,11 +1,10 @@
-"""seg 맵 계층 부호화용 학습 문맥 모델 (float 학습 → 비트 수 추정).
+"""seg 맵 문맥 CNN 학습 (float 학습, 손실 = 보낼 칸의 교차 엔트로피 = 비트 수). 정수화는 build_archive.quantize_ctxnet.
 
-패스 (stride s, h=s/2):
-  A: stride-h 격자에서 (홀,홀) 칸. 아는 것: (짝,짝) 칸 = stride-s 격자 전체.
-  B: 한쪽만 홀수인 칸. 아는 것: (짝,짝) + (홀,홀).
-입력 (stride-h 격자 해상도):
-  현재 맵 one-hot × known(5) + known(1) + 이전 맵 클래스 비율(5) + 전전 맵 비율(5) + is_A(1) + 레벨 one-hot(5) = 22
-출력: 각 칸 5클래스 logits. 손실은 target 칸에서만.
+패스·입력 23채널은 segcodec.py (A1 → A2 → B, 레벨 32..2). 출력: 각 칸 5클래스 logits.
+학습 샘플: 무작위 프레임·레벨·패스의 격자에서 crop. 레벨은 세밀할수록 자주 (비트가 몰려 있다).
+
+    python ctxmodel.py --ch 24 --layers 6 --dils 1,2,4,8,2,1 --steps 20000 --out ../cache/ctxnet.pt
+결과: {"sd": 평가용 state_dict, "dils"} (+ self-compression 이면 "wq" 정수 가중치·스케일, "float", "sc" 이어서 학습용)
 """
 
 from __future__ import annotations
@@ -28,12 +27,19 @@ C_IN = sc.C_IN
 PASSES = sc.PASSES
 
 
-def build_input(cur, prev, prev2, s: int, kind: str, c_in: int = C_IN, bframe: bool = False):
-    """디코더와 같은 정수 입력 (segcodec.build_input_q) 을 float (0..1) 로. cur/prev/prev2: (n,384,512) uint8 numpy."""
+_FI = sc.Inputs()
+
+
+def build_input(cur, prev, prev2, s: int, kind: str):
+    """디코더와 같은 입력 (segcodec.Inputs) 을 float (0..1) 로. cur/prev/prev2: (1,384,512) uint8 numpy (없으면 None).
+    → (입력, 보낼 칸 mask, 격자의 정답 클래스)"""
     h = s // 2
-    x = torch.from_numpy(sc.build_input_q(cur, prev, prev2, s, kind, c_in, bframe)).float() / sc.Q_IN
-    _, target = sc.masks(h, kind)
-    return x, torch.from_numpy(target), torch.from_numpy(cur[:, ::h, ::h].astype(np.int64))
+
+    def fr(m):
+        return _FI.fracs(None if m is None else torch.from_numpy(m), hs=(h,))
+
+    x = _FI.build(torch.from_numpy(cur), s, kind, fr(prev), fr(prev2)) / sc.Q_IN
+    return x, _FI.target[h, kind], torch.from_numpy(cur[:, ::h, ::h].astype(np.int64))
 
 
 class CtxNet(nn.Module):
@@ -62,23 +68,6 @@ def load_ctx(path):
     m = CtxNet(ch, layers, dils, c_in)
     m.load_state_dict(sd)
     return m, sd, dils
-
-
-@torch.no_grad()
-def widen_ctx(old: CtxNet, ch: int) -> CtxNet:
-    """폭을 ch 로 넓힌 CtxNet (처음엔 같은 출력): 새 채널은 작은 무작위 가중치, 다음 층에서 새 입력 채널 가중치는 0."""
-    new = CtxNet(ch, len(old.dils), old.dils)
-    convs_o = [m for m in old.net if isinstance(m, nn.Conv2d)]
-    convs_n = [m for m in new.net if isinstance(m, nn.Conv2d)]
-    for i, (co, cn) in enumerate(zip(convs_o, convs_n)):
-        o, c_in = co.weight.shape[:2]
-        cn.weight.mul_(0.1)
-        cn.bias.zero_()
-        if i > 0:
-            cn.weight[:, c_in:] = 0  # 새 입력 채널 (이전 층의 새 채널) 은 아직 안 쓴다
-        cn.weight[:o, :c_in] = co.weight
-        cn.bias[:o] = co.bias
-    return new
 
 
 @torch.no_grad()
@@ -119,8 +108,8 @@ def fq_weights(model, bits: int) -> dict:
     return out
 
 
-def pad_input(sd: dict, c_in: int) -> dict:
-    """첫 층 입력 채널을 c_in 으로 (새 채널 가중치 0 → 처음엔 같은 출력)."""
+def pad_input(sd: dict, c_in: int = C_IN) -> dict:
+    """첫 층 입력 채널을 c_in 으로 (새 채널 가중치 0 → 처음엔 같은 출력). 22채널 (A 패스를 나누기 전) 체크포인트에서 이어갈 때."""
     sd = dict(sd)
     w = sd["net.0.weight"]
     if w.shape[1] < c_in:
@@ -128,27 +117,20 @@ def pad_input(sd: dict, c_in: int) -> dict:
     return sd
 
 
-def frame_maps(seg, t, bidir: bool = False):
-    """(현재, 문맥1, 문맥2) 맵 (없으면 None). 양방향이면 segcodec.ctx_index 의 순서 (짝수 t: t-2, t-4 / 홀수 t: t-1, t+1)."""
-    a, b = sc.ctx_index(t, len(seg), bidir)
-    return seg[t : t + 1], (seg[a : a + 1] if a is not None else None), (seg[b : b + 1] if b is not None else None)
-
-
-def stream_maps(seg):
-    """스트림 순서의 맵: 첫 쌍용 맵 (seg_pre) + 홀수 프레임 600장. 양방향 모드는 B 프레임 위치가 이 번호로 정해진다."""
-    return np.concatenate([np.load(CACHE / "seg_pre.npy"), seg])
+def frame_maps(seg, t):
+    """(현재, 이전, 전전) 맵 (없으면 None)."""
+    return seg[t : t + 1], (seg[t - 1 : t] if t >= 1 else None), (seg[t - 2 : t - 1] if t >= 2 else None)
 
 
 @torch.inference_mode()
 def eval_bits(model, seg, frames):
     """전체 프레임에서 패스별 비트 수 (coarse 격자 제외)."""
     tot = {}
-    bidir = model.c_in in sc.BIDIR
     for t in frames:
-        cur, prev, prev2 = frame_maps(seg, t, bidir)
+        cur, prev, prev2 = frame_maps(seg, t)
         for s in LEVELS:
-            for kind in sc.PASSES[model.c_in]:
-                x, target, g = build_input(cur, prev, prev2, s, kind, model.c_in, bidir and t % 2 == 1)
+            for kind in PASSES:
+                x, target, g = build_input(cur, prev, prev2, s, kind)
                 logp = F.log_softmax(model(x), 1)
                 nll = -logp.gather(1, g[:, None])[:, 0][:, target].sum().item() / math.log(2)
                 tot[f"{kind}{s}"] = tot.get(f"{kind}{s}", 0.0) + nll
@@ -167,11 +149,8 @@ def main():
     ap.add_argument("--eval-every", type=int, default=500)
     ap.add_argument("--out", default=str(CACHE / "ctxnet.pt"))
     ap.add_argument("--init", default=None)
-    ap.add_argument("--widen-from", default=None, help="이 체크포인트 (self-compression 이면 float 가중치) 를 --ch 폭으로 넓혀서 시작 (처음엔 같은 출력)")
     ap.add_argument("--dils", default=None, help="층별 dilation, 예: 1,2,4,2,1")
     ap.add_argument("--deepen-from", default=None, help="이 체크포인트 (self-compression 이면 float 가중치) 에 --dils 대로 항등 층을 끼워 시작")
-    ap.add_argument("--split-a", action="store_true", help="A 패스를 체커보드로 A1·A2 로 나눈 23채널 모델 (--init 이 22채널이면 새 입력 채널 0 으로 이어서)")
-    ap.add_argument("--bidir", action="store_true", help="--split-a 에 더해 양방향 프레임 순서 (24채널: B 프레임 표시). 학습 맵은 스트림 순서 (seg_pre + 600장)")
     ap.add_argument("--self-compress", type=float, default=0.0,
                     help="> 0 이면 채널별 비트 수를 학습 (selfcomp.py, 시작 --sc-init-bits). 1.0 = 가중치 1비트 ≈ 스트림 1비트")
     ap.add_argument("--sc-init-bits", type=float, default=6.0)
@@ -188,30 +167,18 @@ def main():
     rng = np.random.default_rng(0)
     _, seg, _ = load_gt()
     dils = [int(d) for d in args.dils.split(",")] if args.dils else None
-    assert args.split_a or not args.bidir, "--bidir 은 --split-a 와 함께"
-    c_in = 24 if args.bidir else 23 if args.split_a else C_IN
-    if args.bidir:
-        seg = stream_maps(seg)
-    align = 4 if c_in > C_IN else 2  # 크롭 시작: 패스 패턴의 주기
-    passes = PASSES[c_in]
-    model = CtxNet(args.ch, args.layers, dils, c_in)
-    if args.widen_from:
-        ckw = torch.load(args.widen_from)
-        sdw = ckw.get("float", ckw.get("sd", ckw))
-        old = CtxNet(sdw["net.0.weight"].shape[0], args.layers, ckw.get("dils", dils))
-        old.load_state_dict(sdw)
-        model = widen_ctx(old, args.ch)
-        print(f"폭 {old.net[0].weight.shape[0]} → {args.ch} 로 넓혀서 시작", flush=True)
+    align = 4  # 크롭 시작: 패스 패턴 (A1/A2 는 4칸 주기) 유지
+    model = CtxNet(args.ch, args.layers, dils)
     if args.deepen_from:
         ckd = torch.load(args.deepen_from)
-        sdd = pad_input(ckd.get("float", ckd.get("sd", ckd)), c_in)
-        old = CtxNet(sdd["net.0.weight"].shape[0], len(ckd["dils"]), ckd["dils"], c_in)
+        sdd = pad_input(ckd.get("float", ckd.get("sd", ckd)))
+        old = CtxNet(sdd["net.0.weight"].shape[0], len(ckd["dils"]), ckd["dils"])
         old.load_state_dict(sdd)
         model = deepen_ctx(old, dils)
         print(f"dilation {old.dils} → {dils} 로 깊게 해서 시작", flush=True)
     if args.init:
         ck = torch.load(args.init)
-        model.load_state_dict(pad_input(ck["sd"] if "sd" in ck else ck, c_in))
+        model.load_state_dict(pad_input(ck["sd"] if "sd" in ck else ck))
     print(f"ctxnet params {sum(p.numel() for p in model.parameters()):,}", flush=True)
     sc = None
     groups = [{"params": list(model.parameters()), "lr": args.lr}]
@@ -220,7 +187,7 @@ def main():
 
         sc = SelfCompress(model, args.sc_init_bits)
         if args.init and "sc" in ck and "float" in ck:  # self-compression 이어서: float 가중치 + 비트/스케일
-            model.load_state_dict(pad_input(ck["float"], c_in))
+            model.load_state_dict(pad_input(ck["float"]))
             sc.load_state_dict(ck["sc"])
         if args.deepen_from and "sc" in ckd:  # 옮겨 온 층은 비트/스케일도 그대로, 끼운 항등 층만 새로
             with torch.no_grad():
@@ -238,8 +205,6 @@ def main():
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=args.steps, pct_start=0.05)
     viz = LiveVis(f"comma vcc · seg 문맥 모델 ch{args.ch} L{args.layers}", port=args.port).start()
     eval_frames = list(range(3, 600, 60))  # 10장
-    if args.bidir:  # 스트림 번호: 홀수 = B 프레임, 짝수 = 앵커 → 둘 다 10장씩
-        eval_frames = sorted(eval_frames + list(range(4, 600, 60)))
     # 레벨별 샘플링 비중: 세밀한 레벨에 비트가 몰려 있다
     level_p = np.array([0.04, 0.06, 0.15, 0.3, 0.45])
     t0 = time.time()
@@ -251,9 +216,9 @@ def main():
         ts = rng.integers(0, len(seg), 4)
         xs, tg, gs = [], [], []
         for t in ts:
-            cur, prev, prev2 = frame_maps(seg, int(t), args.bidir)
-            kind = passes[int(rng.integers(len(passes)))]
-            x, target, g = build_input(cur, prev, prev2, s, kind, c_in, args.bidir and int(t) % 2 == 1)
+            cur, prev, prev2 = frame_maps(seg, int(t))
+            kind = PASSES[int(rng.integers(len(PASSES)))]
+            x, target, g = build_input(cur, prev, prev2, s, kind)
             c = min(args.crop, gh, gw)
             # 크롭 시작은 패턴 주기의 배수 (A/B 패턴 유지)
             i0 = int(rng.integers(0, (gh - c) // align + 1)) * align

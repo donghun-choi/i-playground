@@ -5,6 +5,7 @@ cache/gt_seg.npy     (600,384,512)    uint8    홀수 프레임 SegNet argmax
 cache/gt_margin.npy  (600,384,512)    float16  SegNet top1-top2 logit 차 (경계 민감도)
 cache/gt_pose.npy    (600,6)          float32  PoseNet pose 평균 6차원
 cache/gt_pose12.npy  (600,12)         float32  PoseNet 전체 출력
+cache/seg_pre.npy    (1,384,512)      uint8    짝수 프레임 0 의 SegNet argmax (첫 쌍의 '이전 프레임' 용, seg 스트림 맨 앞)
 """
 
 import numpy as np
@@ -41,6 +42,8 @@ with Timer("cache"), torch.inference_mode():
                 print(f"{i + 1}/{N_PAIRS}", flush=True)
 
 small.flush()
+with torch.inference_mode():  # pose_fit.py 와 같은 계산 (배치 1)
+    np.save(CACHE / "seg_pre.npy", net.segnet(torch.from_numpy(np.array(small[0:1]))).argmax(1).numpy().astype(np.uint8))
 np.save(CACHE / "gt_seg.npy", seg)
 np.save(CACHE / "gt_margin.npy", margin)
 np.save(CACHE / "gt_pose12.npy", pose12)

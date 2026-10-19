@@ -1,4 +1,4 @@
-"""실험 공용 도구: 경로, 평가 네트워크, GT 캐시.
+"""lab 공용 도구: 경로, 평가 네트워크, GT 캐시, 평가 경로 근사 (fine_q), 렌더러 불러오기.
 
 평가 네트워크는 1164x874 프레임을 받자마자 512x384 로 bilinear 축소한다.
 그래서 실험은 대부분 '네트워크가 보는 512x384 float 이미지' 공간에서 한다.
@@ -117,6 +117,29 @@ def pose_out(net, even, odd) -> torch.Tensor:
 
 def seg_logits(net, odd) -> torch.Tensor:
     return net.segnet(odd)
+
+
+def parse_widths(s: str | None) -> tuple:
+    """'24,32,40' → (24, 32, 40). None 이면 기본 (16, 24, 32)."""
+    return tuple(int(v) for v in s.split(",")) if s else (16, 24, 32)
+
+
+def quantize_roundtrip(G, bits: int) -> None:
+    """렌더러 가중치를 pack_state(bits) 저장/복원 왕복 값으로 바꾼다 (inflate 와 같은 가중치로 평가/피팅하기 위해)."""
+    from model import pack_state, unpack_state
+
+    G.load_state_dict(unpack_state(pack_state(G.state_dict(), bits), G.state_dict()))
+
+
+def load_renderer(path, widths, bits: int = 0, device="cpu"):
+    """학습 결과 → inflate 와 같은 가중치의 렌더러. bits = 0 이면 이미 양자화된 가중치 (self-compression export) 그대로."""
+    from model import Renderer
+
+    G = Renderer(*widths)
+    G.load_state_dict(torch.load(path, map_location="cpu"))
+    if bits:
+        quantize_roundtrip(G, bits)
+    return G.eval().to(device)
 
 
 def gt_frames():
