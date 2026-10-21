@@ -5,15 +5,18 @@
 
 저장하는 것 (단계 순서)
   sections.json            섹션별 길이·sha256, QNet 층 모양·dilation, 렌더러 폭, pose 모양, 단계별 sha256
-  qnet_layers.npz          QNet 정수 가중치 W{i} B{i} M{i} dil relu                      (ctxe 섹션 풀기)
+  qnet.bin                 ctxe 섹션을 푼 QNet 바이트                                      (ctxe 섹션 풀기)
+  qnet_layers.npz          QNet 정수 가중치 W{i} B{i} M{i} dil relu                      (QNet 바이트 읽기)
   qnet_probe_in.npy        무작위 정수 입력 (1,23,192,256)                                (정수 CNN 산술)
   qnet_probe_out.npy       그 logit
   inputs_t5_s4_A2.npy      맵 5, 레벨 4, A2 패스의 23채널 입력 (1,23,192,256)              (입력 만들기)
   logits_t5_s4_A2.npy      그 입력의 logit (1,5,192,256)
   probs_t5_s4_A2.npy       보낼 칸들의 확률 (m,5) float64 (행 우선 칸 순서)               (확률표)
+  masks.npz                known_h{h}_{패스}, target_h{h}_{패스} bool (h = 16,8,4,2,1)      (패스 마스크)
   seg.npz                  복호화한 seg 맵 (601,384,512) uint8                              (segs 섹션 전체)
   renderer.npz             복원한 렌더러 float 가중치 (state_dict 이름)                     (rend 섹션)
   pose.npz                 B (8,1,24,32), c (600,8), a (600,6) float32                     (pos4 섹션)
+  prev0.npy                렌더러(M_pre) = 첫 쌍의 이전 프레임 (1,384,512,3) float32
   odd_0_3.npy / even_0_3.npy   홀수/짝수 프레임 0..3 (4,384,512,3) float32
   frame_sums.npy           (600,2,3) float64 프레임별 채널 합 (짝수, 홀수) — 전체 프레임 대략 비교
   raw_pair0.npy            첫 쌍 (짝수, 홀수) 의 1164x874 uint8 (2,874,1164,3)
@@ -61,6 +64,7 @@ def dump(archive_zip: str, batch: int = 8):
     qb = wcodec.ec_unpack_qnet(sec["ctxe"])
     qnet, _ = sc.QNet.from_bytes(qb)
     info["qnet_bytes_sha256"] = sha(qb)
+    (GOLDEN / "qnet.bin").write_bytes(qb)
     info["qnet_layers"] = [{"W": list(W.shape), "dil": dil, "relu": relu} for W, _, _, dil, relu in qnet.layers]
     np.savez(GOLDEN / "qnet_layers.npz", **{f"{n}{i}": a for i, L in enumerate(qnet.layers) for n, a in zip("WBM", L[:3])},
              dil=np.array([L[3] for L in qnet.layers]), relu=np.array([L[4] for L in qnet.layers]))
@@ -84,6 +88,8 @@ def dump(archive_zip: str, batch: int = 8):
     np.save(GOLDEN / "inputs_t5_s4_A2.npy", xin.numpy())
     np.save(GOLDEN / "logits_t5_s4_A2.npy", logit.numpy())
     np.save(GOLDEN / "probs_t5_s4_A2.npy", sc.probs(logit[0][:, fi.target[s // 2, kind]].T))
+    np.savez_compressed(GOLDEN / "masks.npz", **{f"{n}_h{h}_{k}": m for h in sc.HS for k in sc.PASSES
+                                                 for n, m in zip(("known", "target"), sc.masks(h, k))})
 
     # rend → 렌더러, pos4 → pose
     G = load_renderer(sec["rend"])
@@ -109,6 +115,7 @@ def dump(archive_zip: str, batch: int = 8):
             even[i:j] = even_frames(prev, pos["a"][i:j], pos["c"][i:j], pos["B"])
     even, odd = even.permute(0, 2, 3, 1).contiguous().numpy(), odd.permute(0, 2, 3, 1).contiguous().numpy()
     print(f"렌더링 {time.time() - t:.0f}s", flush=True)
+    np.save(GOLDEN / "prev0.npy", prev0.permute(0, 2, 3, 1).numpy())
     np.save(GOLDEN / "odd_0_3.npy", odd[:4])
     np.save(GOLDEN / "even_0_3.npy", even[:4])
     np.save(GOLDEN / "frame_sums.npy", np.stack([even.sum((1, 2), dtype=np.float64), odd.sum((1, 2), dtype=np.float64)], 1))

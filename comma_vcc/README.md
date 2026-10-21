@@ -64,6 +64,7 @@ seg 맵 M_i      = 원본 홀수 프레임의 SegNet argmax (+ 맨 앞에 원본
 | `lab/pose_fit.py`, `lab/pose_refine.py`, `lab/posefmt.py` | pose 피팅 (기저+계수), 쌍별 다듬기, 중간 파일 형식 |
 | `lab/build_archive.py` | 정수화 + 인코드 + archive.zip 조립 |
 | `lab/golden.py`, `lab/test_codec.py` | 단계별 기준값 (다시 짠 디코더 확인용), 형식 단위 테스트 |
+| `lab/check_rewrite.py`, `submissions/rewrite/` | 다시 짠 디코더 단계별 검사, 디코더 다시 짜기 뼈대 |
 
 실험·분석 스크립트 (`carrier_*`, `analyze.py`, `seg_errors.py`, `bits_breakdown.py`, `vjp_*`, `swa_renderer.py` 등) 는
 정리하면서 지웠다. 커밋 `4c31838` 에 있다 (`git show 4c31838:comma_vcc/lab/analyze.py`).

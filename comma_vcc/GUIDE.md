@@ -69,6 +69,8 @@ seg 맵 601장 (M_pre, M_0..M_599) 은 계층 순서 + 정수 문맥 CNN + range
 | `lab/build_archive.py` | 139 | 문맥 CNN 정수화 + seg 부호화 + archive.zip 조립 |
 | `lab/golden.py` | 173 | 단계별 기준값 저장 / 비교 (5절) |
 | `lab/test_codec.py` | 152 | 형식 단위 테스트 (캐시 없이 몇 초) |
+| `lab/check_rewrite.py` | 293 | 다시 짠 디코더를 단계마다 golden 과 비교 (PASS / FAIL / TODO) |
+| `submissions/rewrite/` | | 디코더 다시 짜기 뼈대: 함수 시그니처·명세만, 본문은 `NotImplementedError` (README.md) |
 
 - 제출물 (`submissions/semantic_cpu`) 은 디코더와 그 형식의 짝 (encode, pack_*) 만 둔다. 학습·정수화는 lab.
 - 실패한 실험 스크립트 (carrier, 분석, vjp, swa 등) 는 지웠다. 커밋 `4c31838` 에 남아 있다:
@@ -216,13 +218,15 @@ a' = a ⊙ [0.01, 0.01, 2/512, 0.01, 0.01, 2/384]
 
 ## 5. 다시 짜는 순서와 단계별 검증 (golden)
 
-먼저 기준값을 만든다 (약 5분):
+뼈대 `submissions/rewrite/` 의 함수를 아래 표 순서대로 채우고, 단계마다 검사기로 확인한다 (뼈대 README 에 함수 ↔ 단계 표).
 ```bash
 cd comma_vcc/lab
-../.venv/bin/python golden.py dump        # → cache/golden/ (sections.json 에 단계별 sha256)
-../.venv/bin/python -m unittest test_codec -v
+../.venv/bin/python golden.py dump              # 기준값 → cache/golden/ (한 번, 약 6분)
+../.venv/bin/python check_rewrite.py            # 단계마다 PASS / FAIL / TODO (입력은 golden 값이라 단계끼리 독립)
+../.venv/bin/python check_rewrite.py --full decode
+../.venv/bin/python -m unittest test_codec -v   # 형식 단위 테스트 (참조 구현용, 모듈 이름을 바꿔 내 구현에도 쓸 수 있다)
 ```
-내 구현의 중간 결과를 같은 이름의 `.npy`/`.npz` 로 저장하고 `golden.py diff 내파일.npy` 로 비교한다.
+뼈대를 쓰지 않고 자기 구조로 짰다면, 중간 결과를 같은 이름의 `.npy`/`.npz` 로 저장하고 `golden.py diff 내파일.npy` 로 비교한다.
 
 기준 sha256 (v6.26): archive.zip `1cb48d5f…f8fe7b`, 'p' `2ff16e1e…fd95`, seg 맵 601장 `04156f76…b2af`, 전체 .raw `27cc17b9…8b5f`.
 
